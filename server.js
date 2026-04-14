@@ -1960,18 +1960,21 @@ function renderGanttPage(rawData) {
 
   // Left HTML name panel (sticky, does not scroll with chart)
   var namePanelRows = order.map(function(item, idx) {
-    var lbl = item.title.length > 32 ? item.title.slice(0, 31) + '\u2026' : item.title;
     var dc3 = dotC(item);
     var bg3 = idx % 2 === 0 ? 'rgba(255,255,255,0.012)' : 'transparent';
+    var descSnippet = item.plan_description ? item.plan_description.slice(0, 100) + (item.plan_description.length > 100 ? '\u2026' : '') : '';
     return '<div class="gr-name" data-id="' + item.id + '" data-orig-bg="' + bg3 + '"'
+      + ' data-title="' + esc(item.title) + '"'
+      + ' data-desc="' + esc(descSnippet) + '"'
+      + ' data-status="' + esc(item.status || '') + '"'
       + ' style="height:' + ROW_H + 'px;display:flex;align-items:center;gap:7px;padding:0 10px;background:' + bg3 + ';cursor:pointer;box-sizing:border-box">'
       + '<span style="width:8px;height:8px;border-radius:50%;background:' + dc3 + ';flex-shrink:0"></span>'
-      + '<span style="font-size:12px;color:#e2e8f0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(item.title) + '">' + esc(lbl) + '</span>'
+      + '<span style="font-size:12px;color:#e2e8f0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(item.title) + '">' + esc(item.title) + '</span>'
       + '<span style="font-size:10px;color:#64748b;font-family:monospace;flex-shrink:0">#' + item.id + '</span>'
       + '</div>';
   }).join('');
 
-  var namePanel = '<div id="gantt-names" style="flex-shrink:0;width:260px;background:#0f1117;border-right:1px solid #1e2235;overflow:hidden">'
+  var namePanel = '<div id="gantt-names" style="flex-shrink:0;width:320px;background:#0f1117;border-right:1px solid #1e2235;overflow:hidden">'
     + '<div style="height:' + AXIS_H + 'px;border-bottom:1px solid #1e2235;display:flex;align-items:center;padding:0 10px">'
     + '<span style="font-size:10px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Item</span>'
     + '</div>'
@@ -1989,23 +1992,59 @@ function renderGanttPage(rawData) {
     + ticks + todayMarker + arrows + rows
     + '</svg>';
 
-  // Legend strip
-  var legend = '<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:7px 12px;'
-    + 'background:rgba(255,255,255,0.03);border-radius:8px;margin:8px 0;font-size:12px;color:#64748b;border:1px solid #1e2235">'
-    + '<span style="font-weight:600;color:#94a3b8">Legend:</span>'
-    + '<span><span style="color:#22c55e">&#9679;</span> Complete</span>'
-    + '<span><span style="color:#eab308">&#9679;</span> In Progress</span>'
-    + '<span><span style="color:#ef4444">&#9679;</span> Blocked</span>'
-    + '<span><span style="color:#4b5563">&#9679;</span> Open</span>'
-    + '<span style="border-left:1px solid #1e2235;padding-left:12px">Bar = est. time &middot; Fill = % done &middot; Arrows = deps</span>'
-    + '<span style="border-left:1px solid #1e2235;padding-left:12px"><span style="color:#60a5fa">&#9474;</span> Blue = today &middot; Hover name to trace deps</span>'
+  // Legend strip — collapsible
+  var legend = '<div id="gantt-legend-wrap" style="margin:6px 0 10px">'
+    // Toggle button row
+    + '<button id="gantt-legend-btn" onclick="(function(){'
+    +   'var b=document.getElementById(\'gantt-legend-body\');'
+    +   'var btn=document.getElementById(\'gantt-legend-btn\');'
+    +   'var open=b.style.display!==\'none\';'
+    +   'b.style.display=open?\'none\':\'flex\';'
+    +   'btn.setAttribute(\'aria-expanded\',open?\'false\':\'true\');'
+    +   'btn.querySelector(\'.gl-chevron\').style.transform=open?\'rotate(0deg)\':\'rotate(180deg)\';'
+    + '})()" aria-expanded="false" style="display:flex;align-items:center;gap:6px;background:transparent;border:none;cursor:pointer;padding:0;color:#64748b;font-size:12px">'
+    + '<span style="font-weight:600;color:#94a3b8;font-size:12px">Legend</span>'
+    + '<span class="gl-chevron" style="display:inline-block;transition:transform 0.2s;font-size:10px;line-height:1">&#9660;</span>'
+    + '</button>'
+    // Collapsible body — hidden by default
+    + '<div id="gantt-legend-body" style="display:none;flex-wrap:wrap;gap:0;margin-top:5px;'
+    +   'background:rgba(255,255,255,0.03);border:1px solid #1e2235;border-radius:8px;overflow:hidden">'
+    // Section 1: Status dots
+    + '<div style="display:flex;gap:12px;align-items:center;padding:7px 14px;border-right:1px solid #1e2235;flex-shrink:0">'
+    +   '<span style="font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px">Status</span>'
+    +   '<span style="font-size:12px;color:#cbd5e1"><span style="color:#22c55e;font-size:14px">&#9679;</span> Complete</span>'
+    +   '<span style="font-size:12px;color:#cbd5e1"><span style="color:#eab308;font-size:14px">&#9679;</span> In Progress</span>'
+    +   '<span style="font-size:12px;color:#cbd5e1"><span style="color:#ef4444;font-size:14px">&#9679;</span> Blocked</span>'
+    +   '<span style="font-size:12px;color:#cbd5e1"><span style="color:#4b5563;font-size:14px">&#9679;</span> Open</span>'
+    + '</div>'
+    // Section 2: Bar encoding
+    + '<div style="display:flex;gap:10px;align-items:center;padding:7px 14px;border-right:1px solid #1e2235;flex-shrink:0">'
+    +   '<span style="font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px">Bars</span>'
+    +   '<svg width="48" height="14" style="vertical-align:middle"><rect x="0" y="2" width="48" height="10" rx="3" fill="#1e3a5f"/><rect x="0" y="2" width="28" height="10" rx="3" fill="#3b82f6"/></svg>'
+    +   '<span style="font-size:12px;color:#64748b">Width &prop; <strong style="color:#94a3b8">estimated mins</strong>, fill = % done</span>'
+    + '</div>'
+    // Section 3: Arrows
+    + '<div style="display:flex;gap:10px;align-items:center;padding:7px 14px;border-right:1px solid #1e2235;flex-shrink:0">'
+    +   '<span style="font-size:11px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px">Arrows</span>'
+    +   '<svg width="42" height="14" style="vertical-align:middle"><defs><marker id="lg-arr" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#4b5563"/></marker><marker id="lg-arr-r" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z" fill="#ef4444"/></marker></defs><line x1="2" y1="7" x2="34" y2="7" stroke="#4b5563" stroke-width="1.5" marker-end="url(#lg-arr)"/></svg>'
+    +   '<span style="font-size:12px;color:#64748b">Grey = <strong style="color:#94a3b8">dependency</strong></span>'
+    +   '<svg width="42" height="14" style="vertical-align:middle"><line x1="2" y1="7" x2="34" y2="7" stroke="#ef4444" stroke-width="1.5" marker-end="url(#lg-arr-r)"/></svg>'
+    +   '<span style="font-size:12px;color:#64748b">Red = blocked dep</span>'
+    + '</div>'
+    // Section 4: Today line
+    + '<div style="display:flex;gap:10px;align-items:center;padding:7px 14px;flex-shrink:0">'
+    +   '<svg width="14" height="14" style="vertical-align:middle"><line x1="7" y1="0" x2="7" y2="14" stroke="#60a5fa" stroke-width="2" stroke-dasharray="3,2"/></svg>'
+    +   '<span style="font-size:12px;color:#64748b">Blue dashed = <strong style="color:#94a3b8">today</strong></span>'
+    +   '<span style="font-size:12px;color:#64748b;border-left:1px solid #1e2235;padding-left:10px">Hover a name to trace connections</span>'
+    + '</div>'
+    + '</div>'
     + '</div>';
 
   var toolbar = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">'
     + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Gantt &mdash; Dependency View</h2>'
     + '<button id="gantt-cp-btn" style="font-size:12px;padding:5px 16px;border-radius:16px;border:1px solid #f59e0b;background:transparent;color:#f59e0b;cursor:pointer">Critical Path</button>'
     + '</div>'
-    + '<p style="font-size:13px;color:#64748b;margin:0 0 4px">Items ordered by dependency. Scroll chart right &rarr;. Hover a name to trace connections.</p>';
+    + '<p style="font-size:13px;color:#64748b;margin:0 0 4px">Items ordered by dependency. Scroll chart right &rarr;. Hover a name to trace connections. Click a name to see full title &amp; description.</p>';
 
   $('pageContent').innerHTML = toolbar + legend
     + '<div style="display:flex;border:1px solid #1e2235;border-radius:8px;overflow:hidden;background:#0f1117">'
@@ -2092,6 +2131,62 @@ function renderGanttPage(rawData) {
         restoreArrows(); restoreLabels();
       });
     }
+
+    // Click-to-expand: show full title + description in a fixed card
+    var existingCard = document.getElementById('gr-expand-card');
+    if (existingCard) existingCard.remove();
+    var expandCard = document.createElement('div');
+    expandCard.id = 'gr-expand-card';
+    expandCard.style.cssText = 'display:none;position:fixed;background:#1a1f2e;border:1px solid #334155;border-radius:8px;padding:10px 14px;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,0.7);max-width:340px;min-width:200px;word-break:break-word';
+    document.body.appendChild(expandCard);
+    var expandedId = null;
+
+    document.querySelectorAll('.gr-name').forEach(function(nameEl) {
+      var rowId = nameEl.getAttribute('data-id');
+
+      // Long-press for mobile tooltip (title attr handles native tooltip on desktop)
+      var lpTimer;
+      nameEl.addEventListener('touchstart', function() {
+        lpTimer = setTimeout(function() {
+          nameEl.style.background = 'rgba(255,255,255,0.08)';
+          setTimeout(function() { nameEl.style.background = nameEl.getAttribute('data-orig-bg') || 'transparent'; }, 600);
+        }, 500);
+      }, { passive: true });
+      nameEl.addEventListener('touchend', function() { clearTimeout(lpTimer); }, { passive: true });
+
+      nameEl.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (expandedId === rowId) {
+          expandedId = null;
+          expandCard.style.display = 'none';
+          return;
+        }
+        expandedId = rowId;
+        var title = nameEl.getAttribute('data-title') || '';
+        var desc  = nameEl.getAttribute('data-desc')  || '';
+        var status = nameEl.getAttribute('data-status') || '';
+        expandCard.innerHTML =
+          '<div style="font-size:12px;font-weight:700;color:#e2e8f0;line-height:1.4;margin-bottom:' + (desc ? '6' : '0') + 'px">' + esc(title) + '</div>'
+          + (desc ? '<div style="font-size:11px;color:#94a3b8;line-height:1.5;border-top:1px solid #1e2235;padding-top:6px">' + esc(desc) + '</div>' : '')
+          + '<div style="font-size:10px;color:#64748b;margin-top:6px;border-top:1px solid #1e2235;padding-top:5px">Status: <span style="color:#94a3b8">' + esc(status) + '</span> &middot; #' + esc(rowId) + '</div>';
+        expandCard.style.display = 'block';
+        var rect = nameEl.getBoundingClientRect();
+        var cardW = expandCard.offsetWidth;
+        var cardH = expandCard.offsetHeight;
+        var left = rect.right + 10;
+        if (left + cardW > window.innerWidth - 8) left = rect.left - cardW - 10;
+        if (left < 8) left = 8;
+        var top = rect.top;
+        if (top + cardH > window.innerHeight - 8) top = window.innerHeight - cardH - 8;
+        if (top < 8) top = 8;
+        expandCard.style.left = left + 'px';
+        expandCard.style.top  = top  + 'px';
+      });
+    });
+
+    document.addEventListener('click', function() {
+      if (expandedId) { expandedId = null; expandCard.style.display = 'none'; }
+    });
   }, 0);
 }
 
