@@ -25,6 +25,7 @@ jobs:
         with:
           host: 157.119.41.234
           username: root
+          port: 2222
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             set -e
