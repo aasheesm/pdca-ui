@@ -189,6 +189,32 @@ app.get('/api/file-changes', (req, res) => {
   }
 });
 
+app.post('/api/trigger-cycle', (_req, res) => {
+  const { spawn } = require('child_process');
+  const proc = spawn('/root/scripts/pdca-workbuddy-trigger.sh', [], {
+    detached: false,
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  let output = '';
+  proc.stdout.on('data', d => { output += d.toString(); });
+  proc.stderr.on('data', d => { output += d.toString(); });
+
+  proc.on('close', code => {
+    // Extract last meaningful log lines (strip timestamps, dedupe)
+    const lines = [...new Set(
+      output.split('\n')
+        .map(l => l.replace(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] /, '').trim())
+        .filter(Boolean)
+    )];
+    res.json({ ok: code === 0, exitCode: code, lines });
+  });
+
+  proc.on('error', err => {
+    res.status(500).json({ ok: false, error: err.message });
+  });
+});
+
 // ── Login HTML ────────────────────────────────────────────────────────────────
 
 const LOGIN_HTML = `<!DOCTYPE html>
@@ -581,6 +607,22 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     gap: 6px;
   }
   .refresh-btn:hover { border-color: var(--blue); color: var(--blue); }
+  .run-now-btn {
+    background: rgba(59,130,246,0.1);
+    border: 1px solid var(--blue);
+    color: var(--blue);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .run-now-btn:hover { background: rgba(59,130,246,0.2); }
+  .run-now-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .auto-refresh-toggle {
     display: flex;
     align-items: center;
@@ -1048,6 +1090,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="toggle-switch on" id="arSwitch"></div>
         <span style="font-size:12px;color:var(--muted)">Auto</span>
       </div>
+      <button class="run-now-btn" id="runNowBtn" title="Manually trigger the PDCA cron cycle now">▶ Run Now</button>
       <button class="refresh-btn" id="refreshBtn">⟳ Refresh</button>
       <a href="/logout" style="font-size:12px;color:#64748b;text-decoration:none;padding:6px 10px;border:1px solid #2d3148;border-radius:6px;white-space:nowrap;" onmouseover="this.style.color='#e2e8f0';this.style.borderColor='#64748b'" onmouseout="this.style.color='#64748b';this.style.borderColor='#2d3148'">Sign out</a>
     </div>
@@ -1164,11 +1207,11 @@ function phaseBadge(p) {
   return '<span class="badge ' + (m[p]||'badge-plan') + '">' + esc(p||'—') + '</span>';
 }
 
-function showToast(msg) {
+function showToast(msg, duration) {
   const t = $('toast');
   t.textContent = msg;
   t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), 4000);
+  setTimeout(() => t.classList.remove('show'), duration || 4000);
 }
 
 function setFetching(on) {
@@ -1252,6 +1295,24 @@ $('arToggle').addEventListener('click', () => {
 
 $('refreshBtn').addEventListener('click', () => {
   if (currentProject) loadPage(currentPage);
+});
+
+$('runNowBtn').addEventListener('click', async () => {
+  const btn = $('runNowBtn');
+  btn.disabled = true;
+  btn.textContent = '⟳ Running…';
+  try {
+    const res = await fetch('/api/trigger-cycle', { method: 'POST' });
+    const data = await res.json();
+    const summary = data.lines.slice(-6).join(' · ') || 'Cycle complete';
+    showToast(data.ok ? '✅ ' + summary : '⚠️ ' + summary, data.ok ? 3500 : 5000);
+    if (currentProject) loadPage(currentPage);
+  } catch (e) {
+    showToast('❌ Failed to trigger cycle: ' + e.message, 5000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '▶ Run Now';
+  }
 });
 
 // ── Navigation ────────────────────────────────────────────────────────────────
