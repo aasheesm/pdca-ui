@@ -1593,6 +1593,7 @@ let itemsFilter = { search:'', priority:[], phase:[], status:[], agent:'' };
 let itemsTab = 'all'; // 'all' | 'pending' | 'complete' | 'blocked' | 'queued' | 'not-started' | 'dropped'
 let itemsPage = 1;
 let itemsPageSize = 10;
+var ganttShowCritical = false;
 
 // Derive is_blocked: item has depends_on set AND the parent's status is not 'complete'
 function deriveBlocked(items) {
@@ -1618,10 +1619,10 @@ function itemTrafficDot(item) {
 // ─────────────────────────────────────────────────────────────────────────────
 function renderGanttPage(rawData) {
   var data = deriveBlocked(rawData);
-  var ROW_H = 44, LABEL_W = 220, PAD = 16;
-  var BAR_H = 22, BAR_Y_OFF = (ROW_H - BAR_H) / 2;
+  var ROW_H = 44, PAD = 12, BAR_H = 22, BAR_Y_OFF = (ROW_H - BAR_H) / 2;
+  var AXIS_H = 36, PX_PER_DAY = 20;
 
-  // Topological sort respecting depends_on
+  // Topological sort
   var byId = {};
   data.forEach(function(i) { byId[i.id] = i; });
   var visited = new Set(), order = [];
@@ -1633,23 +1634,39 @@ function renderGanttPage(rawData) {
   }
   data.forEach(function(i) { visit(i); });
 
-  var minCreated = Math.min.apply(null, order.map(function(i) {
+  // Date-anchored scale: 20px/day makes SVG wider than viewport → real horizontal scroll
+  var MS = 60000, DAY_MS = 86400000;
+  var rawMin = Math.min.apply(null, order.map(function(i) {
     return i.created_at ? new Date(i.created_at).getTime() : Date.now();
   }));
-  var MS = 60000;
-  var TOTAL_MINS = Math.max(2880, Math.max.apply(null, order.map(function(i) {
-    var s = i.created_at ? (new Date(i.created_at).getTime() - minCreated) / MS : 0;
-    return s + (i.actual_mins || i.estimated_mins || 60);
-  })));
+  var axisStart = new Date(rawMin);
+  axisStart.setHours(0, 0, 0, 0);
+  var axisStartMs = axisStart.getTime();
 
-  var svgW = Math.max(960, LABEL_W + PAD * 2 + 600);
-  var svgH = order.length * ROW_H + 60;
-  var scale = (svgW - LABEL_W - PAD * 2) / TOTAL_MINS;
+  var rawMaxEnd = Math.max.apply(null, order.map(function(i) {
+    var sMs = i.created_at ? new Date(i.created_at).getTime() : Date.now();
+    return sMs + (i.actual_mins || i.estimated_mins || 60) * MS;
+  }));
+  var axisEndMs = Math.max(rawMaxEnd, Date.now() + 14 * DAY_MS);
+  var axisEnd = new Date(axisEndMs);
+  axisEnd.setHours(0, 0, 0, 0);
+  axisEnd.setDate(axisEnd.getDate() + 1);
+  axisEndMs = axisEnd.getTime();
+  var totalDays = Math.ceil((axisEndMs - axisStartMs) / DAY_MS);
 
-  function iStart(item) { return item.created_at ? (new Date(item.created_at).getTime() - minCreated) / MS : 0; }
-  function iDur(item)   { return item.actual_mins || item.estimated_mins || 60; }
-  function iEnd(item)   { return iStart(item) + iDur(item); }
+  var svgW = Math.max(600, totalDays * PX_PER_DAY + PAD * 2);
+  var svgH = order.length * ROW_H + AXIS_H;
+  var todayX = PAD + (Date.now() - axisStartMs) / DAY_MS * PX_PER_DAY;
 
+  function iStartPx(item) {
+    return PAD + (item.created_at ? (new Date(item.created_at).getTime() - axisStartMs) / DAY_MS * PX_PER_DAY : 0);
+  }
+  function iWidthPx(item) {
+    return Math.max(30, (item.actual_mins || item.estimated_mins || 60) * PX_PER_DAY / 1440);
+  }
+  function iEndPx(item) { return iStartPx(item) + iWidthPx(item); }
+
+  // Colour helpers
   function dotC(item) {
     if (item._is_blocked) return '#ef4444';
     if (item.status === 'complete') return '#22c55e';
@@ -1658,10 +1675,10 @@ function renderGanttPage(rawData) {
     return '#4b5563';
   }
   function barFill(item) {
-    if (item._is_blocked) return 'rgba(239,68,68,0.2)';
-    if (item.status === 'complete') return 'rgba(34,197,94,0.2)';
-    if (item.status === 'in-progress') return 'rgba(234,179,8,0.2)';
-    return 'rgba(75,85,99,0.15)';
+    if (item._is_blocked) return 'rgba(239,68,68,0.22)';
+    if (item.status === 'complete') return 'rgba(34,197,94,0.22)';
+    if (item.status === 'in-progress') return 'rgba(234,179,8,0.22)';
+    return 'rgba(75,85,99,0.18)';
   }
   function barSt(item) {
     if (item._is_blocked) return '#ef4444';
@@ -1673,28 +1690,56 @@ function renderGanttPage(rawData) {
   var rowIdx = {};
   order.forEach(function(item, idx) { rowIdx[item.id] = idx; });
 
-  // Build SVG rows
+  // Critical path (by estimated_mins chain length)
+  var longestPath = {};
+  order.forEach(function(item) {
+    var ownDur = item.estimated_mins || 60;
+    longestPath[item.id] = ((item.depends_on && longestPath[item.depends_on]) ? longestPath[item.depends_on] : 0) + ownDur;
+  });
+  var maxPathLen = 0;
+  order.forEach(function(item) { if (longestPath[item.id] > maxPathLen) maxPathLen = longestPath[item.id]; });
+  var cpEnd = null;
+  order.forEach(function(item) { if (!cpEnd && longestPath[item.id] === maxPathLen) cpEnd = item; });
+  var cpIdsArr = [];
+  if (cpEnd) { var cur = cpEnd; while (cur) { cpIdsArr.push(cur.id); cur = cur.depends_on ? byId[cur.depends_on] : null; } }
+
+  // Date tick labels
+  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  var tickEvery = totalDays <= 14 ? 1 : totalDays <= 60 ? 7 : 30;
+  var ticks = '', td2 = new Date(axisStartMs), dc = 0;
+  while (td2.getTime() <= axisEndMs) {
+    if (dc % tickEvery === 0) {
+      var tx2 = PAD + dc * PX_PER_DAY;
+      ticks += '<line x1="' + tx2 + '" y1="' + AXIS_H + '" x2="' + tx2 + '" y2="' + svgH + '" stroke="#1e2235" stroke-width="1"/>'
+        + '<text x="' + tx2 + '" y="' + (AXIS_H - 6) + '" font-size="10" fill="#4b5563" text-anchor="middle" font-family="monospace">'
+        + MONTHS[td2.getMonth()] + ' ' + td2.getDate() + '</text>';
+    }
+    td2.setDate(td2.getDate() + 1); dc++;
+  }
+
+  // Today vertical marker
+  var todayMarker = (todayX >= 0 && todayX <= svgW)
+    ? '<line x1="' + todayX + '" y1="2" x2="' + todayX + '" y2="' + svgH
+      + '" stroke="#3b82f6" stroke-width="2" stroke-dasharray="4,3" opacity="0.9"/>'
+      + '<rect x="' + (todayX - 18) + '" y="2" width="36" height="15" rx="4" fill="#1d4ed8" opacity="0.3"/>'
+      + '<text x="' + todayX + '" y="13" font-size="9" fill="#93c5fd" text-anchor="middle" font-family="monospace" font-weight="700">TODAY</text>'
+    : '';
+
+  // SVG bar rows (labels live in the left HTML panel — no label column in SVG)
   var rows = order.map(function(item, idx) {
-    var y = idx * ROW_H;
-    var xS = LABEL_W + PAD + iStart(item) * scale;
-    var bW = Math.max(8, iDur(item) * scale);
-    var bY = y + BAR_Y_OFF;
-    var mY = y + ROW_H / 2;
-    var lbl = item.title.length > 30 ? item.title.slice(0, 29) + '\u2026' : item.title;
-    var dc = dotC(item), bf = barFill(item), bs = barSt(item);
+    var y = AXIS_H + idx * ROW_H;
+    var xS = iStartPx(item), bW = iWidthPx(item), bY = y + BAR_Y_OFF;
+    var bf = barFill(item), bs = barSt(item);
     var pct = item.status === 'complete' ? 100
       : (item.actual_mins && item.estimated_mins ? Math.min(100, Math.round(item.actual_mins / item.estimated_mins * 100))
       : (item.status === 'in-progress' ? 40 : 0));
     var pW = bW * pct / 100;
-    var bgFill = idx % 2 === 0 ? 'rgba(255,255,255,0.015)' : 'transparent';
+    var bgFill = idx % 2 === 0 ? 'rgba(255,255,255,0.012)' : 'transparent';
     var durLbl = item.actual_mins ? (item.actual_mins + 'm') : (item.estimated_mins ? (item.estimated_mins + 'm est') : '');
-    var tooltip = '#' + item.id + ' ' + item.title + ' | status: ' + item.status + ' | est: ' + (item.estimated_mins || '-') + 'm | actual: ' + (item.actual_mins || '-') + 'm | phase: ' + item.phase;
-    var prog = pW > 0 ? ('<rect x="' + xS + '" y="' + bY + '" width="' + pW + '" height="' + BAR_H + '" rx="4" fill="' + bs + '" opacity="0.45"/>') : '';
-    return '<g>'
-      + '<rect x="0" y="' + y + '" width="' + svgW + '" height="' + ROW_H + '" fill="' + bgFill + '"/>'
-      + '<circle cx="12" cy="' + mY + '" r="5" fill="' + dc + '"/>'
-      + '<text x="22" y="' + (mY + 4) + '" font-size="12" fill="#e2e8f0" font-family="system-ui,sans-serif">' + esc(lbl) + '</text>'
-      + '<text x="' + (LABEL_W - 6) + '" y="' + (mY + 4) + '" font-size="10" fill="#64748b" text-anchor="end" font-family="monospace">#' + item.id + '</text>'
+    var tooltip = '#' + item.id + ' ' + item.title + ' | ' + item.status + ' | est: ' + (item.estimated_mins || '-') + 'm | actual: ' + (item.actual_mins || '-') + 'm';
+    var prog = pW > 0 ? ('<rect x="' + xS + '" y="' + bY + '" width="' + pW + '" height="' + BAR_H + '" rx="4" fill="' + bs + '" opacity="0.5"/>') : '';
+    return '<g class="gantt-bar" data-id="' + item.id + '" data-orig-bg="' + bgFill + '">'
+      + '<rect class="gantt-bar-bg" x="0" y="' + y + '" width="' + svgW + '" height="' + ROW_H + '" fill="' + bgFill + '"/>'
       + '<rect x="' + xS + '" y="' + bY + '" width="' + bW + '" height="' + BAR_H + '" rx="4" fill="' + bf + '" stroke="' + bs + '" stroke-width="1"/>'
       + prog
       + '<text x="' + (xS + bW + 4) + '" y="' + (bY + 14) + '" font-size="10" fill="#64748b" font-family="monospace">' + esc(durLbl) + '</text>'
@@ -1702,60 +1747,160 @@ function renderGanttPage(rawData) {
       + '</g>';
   }).join('');
 
-  // Dependency arrows (bezier curves)
+  // Dependency arrows
   var arrows = order.filter(function(item) {
     return item.depends_on && rowIdx[item.depends_on] !== undefined;
   }).map(function(item) {
     var fi = rowIdx[item.depends_on];
     var fromItem = byId[item.depends_on];
-    var fx = Math.min(svgW - 10, LABEL_W + PAD + iEnd(fromItem) * scale);
-    var fy = fi * ROW_H + ROW_H / 2;
-    var tx = LABEL_W + PAD + iStart(item) * scale;
-    var ty = rowIdx[item.id] * ROW_H + ROW_H / 2;
-    var mx = (fx + tx) / 2;
+    var fx = Math.min(svgW - 4, iEndPx(fromItem));
+    var fy = AXIS_H + fi * ROW_H + ROW_H / 2;
+    var txi = iStartPx(item), ty = AXIS_H + rowIdx[item.id] * ROW_H + ROW_H / 2;
+    var mx = (fx + txi) / 2;
     var col = item._is_blocked ? '#ef4444' : '#4b5563';
     var dash = item._is_blocked ? '4,3' : 'none';
     var mid = item._is_blocked ? 'red' : 'gray';
-    return '<path d="M' + fx + ',' + fy + ' C' + mx + ',' + fy + ' ' + mx + ',' + ty + ' ' + tx + ',' + ty + '"'
-      + ' fill="none" stroke="' + col + '" stroke-width="1.5" stroke-dasharray="' + dash + '" opacity="0.7"'
+    return '<path id="garr-' + item.id + '" class="gantt-arrow" data-from="' + item.depends_on + '" data-to="' + item.id + '" data-blocked="' + (item._is_blocked ? '1' : '0') + '"'
+      + ' d="M' + fx + ',' + fy + ' C' + mx + ',' + fy + ' ' + mx + ',' + ty + ' ' + txi + ',' + ty + '"'
+      + ' fill="none" stroke="' + col + '" stroke-width="1.5" stroke-dasharray="' + dash + '" opacity="0.4"'
       + ' marker-end="url(#arr-' + mid + ')"/>';
   }).join('');
 
-  // Time axis
-  var tickInt = TOTAL_MINS <= 2880 ? 480 : TOTAL_MINS <= 10080 ? 1440 : 10080;
-  var tickLbl = tickInt === 480 ? '8h' : tickInt === 1440 ? '1d' : '1w';
-  var ticks = '';
-  for (var t = 0; t <= TOTAL_MINS; t += tickInt) {
-    var tx2 = LABEL_W + PAD + t * scale;
-    ticks += '<line x1="' + tx2 + '" y1="30" x2="' + tx2 + '" y2="' + (svgH - 10) + '" stroke="#1e2235" stroke-width="1"/>'
-      + '<text x="' + tx2 + '" y="20" font-size="10" fill="#4b5563" text-anchor="middle" font-family="monospace">+' + Math.round(t / tickInt) + tickLbl + '</text>';
-  }
+  // Left HTML name panel (sticky, does not scroll with chart)
+  var namePanelRows = order.map(function(item, idx) {
+    var lbl = item.title.length > 32 ? item.title.slice(0, 31) + '\u2026' : item.title;
+    var dc3 = dotC(item);
+    var bg3 = idx % 2 === 0 ? 'rgba(255,255,255,0.012)' : 'transparent';
+    return '<div class="gr-name" data-id="' + item.id + '" data-orig-bg="' + bg3 + '"'
+      + ' style="height:' + ROW_H + 'px;display:flex;align-items:center;gap:7px;padding:0 10px;background:' + bg3 + ';cursor:pointer;box-sizing:border-box">'
+      + '<span style="width:8px;height:8px;border-radius:50%;background:' + dc3 + ';flex-shrink:0"></span>'
+      + '<span style="font-size:12px;color:#e2e8f0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(item.title) + '">' + esc(lbl) + '</span>'
+      + '<span style="font-size:10px;color:#64748b;font-family:monospace;flex-shrink:0">#' + item.id + '</span>'
+      + '</div>';
+  }).join('');
 
-  var svg = '<svg width="' + svgW + '" height="' + svgH + '" xmlns="http://www.w3.org/2000/svg" style="display:block">'
+  var namePanel = '<div id="gantt-names" style="flex-shrink:0;width:260px;background:#0f1117;border-right:1px solid #1e2235;overflow:hidden">'
+    + '<div style="height:' + AXIS_H + 'px;border-bottom:1px solid #1e2235;display:flex;align-items:center;padding:0 10px">'
+    + '<span style="font-size:10px;font-weight:600;color:#64748b;text-transform:uppercase;letter-spacing:.5px">Item</span>'
+    + '</div>'
+    + namePanelRows + '</div>';
+
+  // SVG assembly
+  var svg = '<svg id="gantt-svg" width="' + svgW + '" height="' + svgH + '" xmlns="http://www.w3.org/2000/svg" style="display:block">'
     + '<defs>'
     + '<marker id="arr-gray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#4b5563"/></marker>'
-    + '<marker id="arr-red" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#ef4444"/></marker>'
+    + '<marker id="arr-red"  markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#ef4444"/></marker>'
+    + '<marker id="arr-cp"   markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#f59e0b"/></marker>'
     + '</defs>'
     + '<rect width="' + svgW + '" height="' + svgH + '" fill="#0f1117"/>'
-    + '<line x1="' + LABEL_W + '" y1="28" x2="' + LABEL_W + '" y2="' + svgH + '" stroke="#1e2235" stroke-width="1"/>'
-    + ticks + arrows + rows
+    + '<line x1="0" y1="' + AXIS_H + '" x2="' + svgW + '" y2="' + AXIS_H + '" stroke="#1e2235" stroke-width="1"/>'
+    + ticks + todayMarker + arrows + rows
     + '</svg>';
 
-  var legend = '<div style="display:flex;gap:16px;align-items:center;padding:10px 0 4px;font-size:12px;color:#64748b;flex-wrap:wrap">'
-    + '<span><span style="color:#22c55e">●</span> Complete</span>'
-    + '<span><span style="color:#eab308">●</span> In Progress</span>'
-    + '<span><span style="color:#ef4444">●</span> Blocked</span>'
-    + '<span><span style="color:#4b5563">●</span> Open</span>'
-    + '<span style="margin-left:8px;border-left:1px solid #1e2235;padding-left:8px">Bar width = estimated mins &nbsp;·&nbsp; Fill = % done &nbsp;·&nbsp; Arrows = dependencies &nbsp;·&nbsp; Hover for details</span>'
+  // Legend strip
+  var legend = '<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:7px 12px;'
+    + 'background:rgba(255,255,255,0.03);border-radius:8px;margin:8px 0;font-size:12px;color:#64748b;border:1px solid #1e2235">'
+    + '<span style="font-weight:600;color:#94a3b8">Legend:</span>'
+    + '<span><span style="color:#22c55e">&#9679;</span> Complete</span>'
+    + '<span><span style="color:#eab308">&#9679;</span> In Progress</span>'
+    + '<span><span style="color:#ef4444">&#9679;</span> Blocked</span>'
+    + '<span><span style="color:#4b5563">&#9679;</span> Open</span>'
+    + '<span style="border-left:1px solid #1e2235;padding-left:12px">Bar = est. time &middot; Fill = % done &middot; Arrows = deps</span>'
+    + '<span style="border-left:1px solid #1e2235;padding-left:12px"><span style="color:#60a5fa">&#9474;</span> Blue = today &middot; Hover name to trace deps</span>'
     + '</div>';
 
-  $('pageContent').innerHTML =
-    '<div style="padding:0 0 8px">'
-    + '<h2 style="font-size:18px;font-weight:600;margin:0 0 4px">Gantt — Dependency View</h2>'
-    + '<p style="font-size:13px;color:#64748b;margin:0">Items in dependency order. Dashed red arrows = blocked dependency. Bar fill = progress.</p>'
+  var toolbar = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">'
+    + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Gantt &mdash; Dependency View</h2>'
+    + '<button id="gantt-cp-btn" style="font-size:12px;padding:5px 16px;border-radius:16px;border:1px solid #f59e0b;background:transparent;color:#f59e0b;cursor:pointer">Critical Path</button>'
     + '</div>'
-    + legend
-    + '<div style="overflow-x:auto;border:1px solid #1e2235;border-radius:8px;margin-top:8px">' + svg + '</div>';
+    + '<p style="font-size:13px;color:#64748b;margin:0 0 4px">Items ordered by dependency. Scroll chart right &rarr;. Hover a name to trace connections.</p>';
+
+  $('pageContent').innerHTML = toolbar + legend
+    + '<div style="display:flex;border:1px solid #1e2235;border-radius:8px;overflow:hidden;background:#0f1117">'
+    + namePanel
+    + '<div id="gantt-scroll" style="overflow-x:auto;flex:1">' + svg + '</div>'
+    + '</div>';
+
+  // Interactivity — runs after innerHTML is set
+  setTimeout(function() {
+    var cpActive = false;
+    var cpIds = cpIdsArr;
+    var scrollEl = document.getElementById('gantt-scroll');
+
+    // Auto-scroll: put today near left edge
+    if (scrollEl && todayX > 0) { scrollEl.scrollLeft = Math.max(0, todayX - 80); }
+
+    function allArrows() { return document.querySelectorAll('.gantt-arrow'); }
+
+    function restoreArrows() {
+      allArrows().forEach(function(el) {
+        var from = parseInt(el.getAttribute('data-from'), 10);
+        var to   = parseInt(el.getAttribute('data-to'),   10);
+        var blocked = el.getAttribute('data-blocked') === '1';
+        if (cpActive) {
+          var onCp = cpIds.indexOf(from) !== -1 && cpIds.indexOf(to) !== -1;
+          el.setAttribute('opacity', onCp ? '1' : '0.06');
+          el.setAttribute('stroke-width', onCp ? '2.5' : '1');
+          el.setAttribute('stroke', onCp ? '#f59e0b' : (blocked ? '#ef4444' : '#4b5563'));
+          el.setAttribute('marker-end', onCp ? 'url(#arr-cp)' : (blocked ? 'url(#arr-red)' : 'url(#arr-gray)'));
+        } else {
+          el.setAttribute('opacity', '0.4');
+          el.setAttribute('stroke-width', '1.5');
+          el.setAttribute('stroke', blocked ? '#ef4444' : '#4b5563');
+          el.setAttribute('marker-end', blocked ? 'url(#arr-red)' : 'url(#arr-gray)');
+        }
+      });
+    }
+
+    function restoreLabels() {
+      document.querySelectorAll('.gr-name').forEach(function(el) {
+        var id = parseInt(el.getAttribute('data-id'), 10);
+        var span = el.querySelectorAll('span')[1];
+        if (!span) return;
+        var onCp = cpActive && cpIds.indexOf(id) !== -1;
+        span.style.color = onCp ? '#fbbf24' : '#e2e8f0';
+        span.style.fontWeight = onCp ? '700' : 'normal';
+      });
+    }
+
+    // Name-row hover: highlight connected arrows
+    document.querySelectorAll('.gr-name').forEach(function(nameEl) {
+      var rowId = nameEl.getAttribute('data-id');
+      var origBg = nameEl.getAttribute('data-orig-bg') || 'transparent';
+      nameEl.addEventListener('mouseenter', function() {
+        nameEl.style.background = 'rgba(255,255,255,0.05)';
+        var barBg = document.querySelector('.gantt-bar[data-id="' + rowId + '"] .gantt-bar-bg');
+        if (barBg) barBg.setAttribute('fill', 'rgba(255,255,255,0.05)');
+        allArrows().forEach(function(el) {
+          var from = el.getAttribute('data-from'), to = el.getAttribute('data-to');
+          if (String(from) === rowId || String(to) === rowId) {
+            el.setAttribute('opacity', '1'); el.setAttribute('stroke-width', '2.5');
+          } else { el.setAttribute('opacity', '0.04'); }
+        });
+      });
+      nameEl.addEventListener('mouseleave', function() {
+        nameEl.style.background = origBg;
+        var barGEl = document.querySelector('.gantt-bar[data-id="' + rowId + '"]');
+        if (barGEl) {
+          var bg = barGEl.querySelector('.gantt-bar-bg');
+          if (bg) bg.setAttribute('fill', barGEl.getAttribute('data-orig-bg') || 'transparent');
+        }
+        restoreArrows();
+      });
+    });
+
+    // Critical path toggle
+    var cpBtn = document.getElementById('gantt-cp-btn');
+    if (cpBtn) {
+      cpBtn.addEventListener('click', function() {
+        cpActive = !cpActive;
+        cpBtn.style.background = cpActive ? '#f59e0b' : 'transparent';
+        cpBtn.style.color      = cpActive ? '#000'   : '#f59e0b';
+        cpBtn.textContent      = cpActive ? 'Hide Critical Path' : 'Critical Path';
+        restoreArrows(); restoreLabels();
+      });
+    }
+  }, 0);
 }
 
 function renderItemsPage(rawData) {
