@@ -189,6 +189,29 @@ app.get('/api/file-changes', (req, res) => {
   }
 });
 
+// Queue a single item (open → queued). Zero LLM calls — just state change + kick processor.
+app.post('/api/items/:id/queue', (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const row = db.prepare('SELECT id, status, agent_assigned FROM pdca_items WHERE id = ?').get(id);
+    if (!row) return res.status(404).json({ error: 'Item not found' });
+    if (!['open'].includes(row.status)) {
+      return res.json({ ok: false, message: `Item is already ${row.status} — cannot queue` });
+    }
+    db.prepare("UPDATE pdca_items SET status='queued', started_at=datetime('now') WHERE id=?").run(id);
+
+    // Kick the queue processor in the background (non-blocking)
+    const { spawn } = require('child_process');
+    spawn('/root/scripts/pdca-queue-processor.sh', [row.agent_assigned || ''], {
+      detached: true, stdio: 'ignore'
+    }).unref();
+
+    res.json({ ok: true, message: 'Queued' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/trigger-cycle', (_req, res) => {
   const { spawn } = require('child_process');
   const proc = spawn('/root/scripts/pdca-workbuddy-trigger.sh', [], {
@@ -623,6 +646,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
   .run-now-btn:hover { background: rgba(59,130,246,0.2); }
   .run-now-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .row-trigger-btn {
+    background: rgba(59,130,246,0.08);
+    border: 1px solid rgba(59,130,246,0.35);
+    color: var(--blue);
+    border-radius: 4px;
+    padding: 2px 7px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.15s;
+    line-height: 1.4;
+  }
+  .row-trigger-btn:hover { background: rgba(59,130,246,0.2); }
+  .row-trigger-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .auto-refresh-toggle {
     display: flex;
     align-items: center;
@@ -964,6 +1000,71 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   #hamburgerBtn:hover { border-color: var(--blue); color: var(--blue); }
 
   /* ── Responsive ── */
+  /* ── Item Cards (mobile view) ── */
+  .items-card-view {
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    padding: 2px 0 12px;
+  }
+  .item-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    cursor: default;
+    transition: background 0.1s;
+  }
+  .item-card.clickable { cursor: pointer; }
+  .item-card.clickable:hover { background: var(--hover); }
+  .item-card-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .item-card-dot { flex-shrink: 0; margin-top: 2px; }
+  .item-card-title {
+    flex: 1;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    line-height: 1.4;
+  }
+  .item-card-id {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+  .item-card-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .item-card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .item-card-meta-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .item-card-meta-label { opacity: 0.6; }
+  .item-card-expand {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    display: none;
+  }
+  .item-card-expand.open { display: block; }
+  .item-card-expand .expand-grid { grid-template-columns: 1fr; }
+
   @media (max-width: 768px) {
     body { font-size: 13px; }
 
@@ -1031,6 +1132,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     /* Page content padding */
     #pageContent { padding: 14px; }
+
+    /* Items page: hide table, show cards on mobile */
+    .items-table-view { display: none !important; }
+    .items-card-view { display: flex !important; }
   }
 
   @media (max-width: 480px) {
@@ -1314,6 +1419,29 @@ $('runNowBtn').addEventListener('click', async () => {
     btn.textContent = '▶ Run Now';
   }
 });
+
+async function queueItem(evt, itemId) {
+  evt.stopPropagation(); // don't expand the row
+  const btn = evt.currentTarget;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await fetch('/api/items/' + itemId + '/queue', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast('⏳ #' + itemId + ' queued — agent will pick it up shortly');
+      if (currentProject) setTimeout(() => loadPage(currentPage), 800);
+    } else {
+      showToast('⚠️ ' + data.message, 4000);
+      btn.disabled = false;
+      btn.textContent = '▶';
+    }
+  } catch (e) {
+    showToast('❌ ' + e.message, 5000);
+    btn.disabled = false;
+    btn.textContent = '▶';
+  }
+}
 
 // ── Navigation ────────────────────────────────────────────────────────────────
 document.querySelectorAll('.nav-item').forEach(item => {
@@ -2001,7 +2129,8 @@ function renderItemsPage(rawData) {
     + '<button class="clear-btn" onclick="clearItemsFilters()">Clear</button>'
     + '</div>'
     + '<div class="result-count" id="items-count"></div>'
-    + '<div class="table-wrap">'
+    + '<div class="items-card-view" id="items-cards"></div>'
+    + '<div class="table-wrap items-table-view">'
     + '<div class="table-toolbar">' + makeDensityBtn('tbl-items') + '</div>'
     + '<div class="table-scroll"><table id="tbl-items">'
     + '<thead><tr>'
@@ -2017,9 +2146,11 @@ function renderItemsPage(rawData) {
     + '<th data-col="actual_mins">Actual(m)</th>'
     + '<th data-col="completed_at">Completed</th>'
     + '<th data-col="created_at">Created</th>'
+    + '<th style="width:38px"></th>'
     + '</tr></thead><tbody id="items-tbody"></tbody></table></div>'
     + '<div class="pagination-bar" id="items-pgbar"></div>'
-    + '</div>';
+    + '</div>'
+    + '<div class="pagination-bar items-card-view" id="items-pgbar-cards"></div>';
 
   $('pageContent').innerHTML = html;
   applyDensity('tbl-items');
@@ -2128,11 +2259,15 @@ function redrawItems() {
 
   const tbody = document.getElementById('items-tbody');
   if (!tbody) return;
-  const NCOLS = 12; // including traffic dot col
+  const NCOLS = 13; // traffic dot + 11 data cols + trigger col
   tbody.innerHTML = pageSlice.map(item => {
     const eid = 'ex-item-' + item.id;
     const hasDetail = item.plan_description || item.actual_description || item.remarks || item.errors_encountered || item.files_modified;
     const files = parseArr(item.files_modified);
+    const canQueue = item.status === 'open';
+    const triggerBtn = canQueue
+      ? '<button class="row-trigger-btn" onclick="queueItem(event,'+item.id+')" title="Queue this item now">▶</button>'
+      : '<span style="color:var(--muted);font-size:11px">'+(item.status==='queued'?'⏳':item.status==='in-progress'?'⚙':item.status==='complete'?'✓':'—')+'</span>';
     return '<tr class="'+(hasDetail?'clickable-row':'')+'" '+(hasDetail?'data-expand="'+eid+'"':'')+' title="'+(hasDetail?'Click to expand':'')+'">'
       + '<td style="text-align:center;padding:10px 6px">' + itemTrafficDot(item) + '</td>'
       + '<td class="mono">#'+item.id+'</td>'
@@ -2146,6 +2281,7 @@ function redrawItems() {
       + '<td class="dim">'+fmt(item.actual_mins)+'</td>'
       + '<td class="dim">' + timeAgoCell(item.completed_at) + '</td>'
       + '<td class="dim">' + timeAgoCell(item.created_at) + '</td>'
+      + '<td style="text-align:center;width:38px">' + triggerBtn + '</td>'
       + '</tr>'
       + (hasDetail ? '<tr class="expand-row" id="'+eid+'"><td colspan="'+NCOLS+'">'
         + '<div class="expand-grid">'
@@ -2158,11 +2294,61 @@ function redrawItems() {
   }).join('');
 
   attachExpand(document.getElementById('tbl-items'));
+
+  // Mobile card view
+  const cardsEl = document.getElementById('items-cards');
+  if (cardsEl) {
+    cardsEl.innerHTML = pageSlice.map(item => {
+      const cid = 'cx-item-' + item.id;
+      const hasDetail = !!(item.plan_description || item.actual_description || item.remarks || item.errors_encountered || item.files_modified);
+      const cardFiles = parseArr(item.files_modified);
+      const estMins = item.estimated_mins ? fmtMins(item.estimated_mins) : null;
+      const actMins = item.actual_mins ? fmtMins(item.actual_mins) : null;
+      const canQueue = item.status === 'open';
+      return '<div class="item-card'+(hasDetail?' clickable':'')+'" '+(hasDetail?'onclick="toggleItemCard(\''+cid+'\')"':'')+' >'
+        + '<div class="item-card-header">'
+        + '<span class="item-card-dot">' + itemTrafficDot(item) + '</span>'
+        + '<span class="item-card-title">'+esc(item.title)+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</span>'
+        + '<span class="item-card-id">#'+item.id+'</span>'
+        + '</div>'
+        + '<div class="item-card-badges">'
+        + statusBadge(item._is_blocked ? 'blocked' : item.status)
+        + ' ' + priorityBadge(item.priority)
+        + ' ' + phaseBadge(item.phase)
+        + (canQueue ? ' <button class="row-trigger-btn" onclick="event.stopPropagation();queueItem(event,'+item.id+')" title="Queue this item now">▶ Queue</button>' : '')
+        + '</div>'
+        + '<div class="item-card-meta">'
+        + (item.category ? '<span class="item-card-meta-item"><span class="item-card-meta-label">cat</span>&nbsp;'+esc(item.category)+'</span>' : '')
+        + (item.agent_assigned ? '<span class="item-card-meta-item"><span class="item-card-meta-label">agent</span>&nbsp;'+esc(item.agent_assigned)+'</span>' : '')
+        + (estMins ? '<span class="item-card-meta-item"><span class="item-card-meta-label">est</span>&nbsp;'+estMins+'</span>' : '')
+        + (actMins ? '<span class="item-card-meta-item"><span class="item-card-meta-label">actual</span>&nbsp;'+actMins+'</span>' : '')
+        + '</div>'
+        + (hasDetail ? '<div class="item-card-expand" id="'+cid+'">'
+          + '<div class="expand-grid" style="grid-template-columns:1fr">'
+          + (item.plan_description ? '<div class="expand-field"><label>Required</label><p>'+esc(item.plan_description)+'</p></div>' : '')
+          + (item.actual_description ? '<div class="expand-field"><label>Done</label><p>'+esc(item.actual_description)+'</p></div>' : '')
+          + (item.remarks ? '<div class="expand-field"><label>Remarks</label><p>'+esc(item.remarks)+'</p></div>' : '')
+          + (item.errors_encountered ? '<div class="expand-field errors"><label>Errors</label><p>'+esc(item.errors_encountered)+'</p></div>' : '')
+          + (cardFiles.length ? '<div class="expand-field"><label>Files Modified</label><p>'+cardFiles.map(f=>'<span class="tag">'+esc(f)+'</span>').join(' ')+'</p></div>' : '')
+          + '</div></div>' : '')
+        + '</div>';
+    }).join('');
+  }
+
   updateTabStats(data);
   renderPagination('items-pgbar', itemsPage, totalPages, total, itemsPageSize, start,
     (pg) => { itemsPage = pg; redrawItems(); },
     (sz) => { itemsPageSize = sz; itemsPage = 1; redrawItems(); }
   );
+  renderPagination('items-pgbar-cards', itemsPage, totalPages, total, itemsPageSize, start,
+    (pg) => { itemsPage = pg; redrawItems(); },
+    (sz) => { itemsPageSize = sz; itemsPage = 1; redrawItems(); }
+  );
+}
+
+function toggleItemCard(id) {
+  var el = document.getElementById(id);
+  if (el) el.classList.toggle('open');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
