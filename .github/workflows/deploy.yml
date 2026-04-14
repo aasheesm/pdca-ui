@@ -1,0 +1,43 @@
+name: Deploy to VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+
+jobs:
+  deploy:
+    name: SSH Deploy & Restart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: 157.119.41.234
+          username: root
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            set -e
+            echo "=== Pulling latest code ==="
+            cd /root/projects/pdca-ui
+            git pull origin master
+
+            echo "=== Installing dependencies ==="
+            npm install --production
+
+            echo "=== Restarting PM2 process ==="
+            pm2 restart pdca-dashboard
+
+            echo "=== Status ==="
+            pm2 show pdca-dashboard
+            echo "Deploy complete."
