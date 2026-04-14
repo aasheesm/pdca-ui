@@ -17,6 +17,28 @@ try {
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.exec("CREATE TABLE IF NOT EXISTS pdca_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, line TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))");
+
+  // ── PDCA v2 migration: chain columns + pdca_projects table ──────────────────
+  (function runMigrations() {
+    const cols = new Set(db.prepare('PRAGMA table_info(pdca_items)').all().map(c => c.name));
+    const chainCols = ['source_id','chain_root_id','iteration','chain_status','escalated_to','check_verdict','check_score','check_evidence','act_learnings'];
+    const addCol = (col, type) => {
+      if (!cols.has(col)) db.prepare(`ALTER TABLE pdca_items ADD COLUMN ${col} ${type}`).run();
+    };
+    chainCols.forEach(col => addCol(col, 'TEXT'));
+    const hasProjectsTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdca_projects'").get();
+    if (!hasProjectsTable) {
+      db.exec(`CREATE TABLE pdca_projects (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL UNIQUE,
+        description TEXT,
+        created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+      )`);
+      const projects = db.prepare('SELECT DISTINCT project_id FROM pdca_items').all();
+      const insert = db.prepare('INSERT INTO pdca_projects (name) VALUES (?)');
+      projects.forEach(r => { try { insert.run(r.project_id); } catch (_) {} });
+    }
+  })();
 } catch (err) {
   console.error('Failed to open database:', err.message);
   process.exit(1);
@@ -195,6 +217,59 @@ app.get('/api/file-changes', (req, res) => {
       LIMIT ?
     `).all(project, lim);
     res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/chains', (req, res) => {
+  try {
+    const { project } = req.query;
+    if (!project) return res.status(400).json({ error: 'project param required' });
+
+    const itemCols = new Set(
+      db.prepare('PRAGMA table_info(pdca_items)').all().map(col => col.name)
+    );
+    const requiredCols = [
+      'source_id', 'chain_root_id', 'iteration', 'chain_status',
+      'escalated_to', 'check_verdict', 'check_score', 'check_evidence',
+      'act_learnings'
+    ];
+    const missing = requiredCols.filter(col => !itemCols.has(col));
+    const hasProjectsTable = !!db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdca_projects'"
+    ).get();
+
+    if (missing.length || !hasProjectsTable) {
+      return res.json({
+        supported: false,
+        missing_columns: missing,
+        missing_tables: hasProjectsTable ? [] : ['pdca_projects'],
+        chains: []
+      });
+    }
+
+    const chains = db.prepare(`
+      SELECT
+        chain_root_id,
+        project_id,
+        MAX(CASE WHEN id = chain_root_id THEN title END) AS root_title,
+        MAX(COALESCE(chain_status, 'active')) AS chain_status,
+        MAX(COALESCE(iteration, 1)) AS max_iteration,
+        MAX(COALESCE(check_score, 0)) AS latest_check_score,
+        MAX(CASE WHEN phase = 'check' THEN check_verdict END) AS latest_check_verdict,
+        MAX(CASE WHEN escalated_to IS NOT NULL THEN escalated_to END) AS escalated_to,
+        SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS completed_items,
+        COUNT(*) AS total_items,
+        MAX(created_at) AS last_activity_at
+      FROM pdca_items
+      WHERE project_id = ?
+        AND chain_root_id IS NOT NULL
+      GROUP BY chain_root_id, project_id
+      ORDER BY last_activity_at DESC, chain_root_id DESC
+    `).all(project);
+
+    res.json({ supported: true, chains });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -581,7 +656,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     font-size: 13px;
   }
   .done-item:last-child { border-bottom: none; }
-  .done-check { color: var(--green); font-size: 15px; flex-shrink: 0; }
+  .done-check { color: var(--green); flex-shrink: 0; display: inline-flex; align-items: center; }
+  .done-check svg { width: 15px; height: 15px; }
   .done-title { flex: 1; color: var(--text); }
   .done-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
 
@@ -689,7 +765,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     background: rgba(59,130,246,0.08);
     color: var(--text);
   }
-  .nav-item .nav-icon { font-size: 16px; flex-shrink: 0; width: 20px; text-align: center; }
+  .nav-item .nav-icon { flex-shrink: 0; width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; }
+  .nav-item .nav-icon svg { width: 16px; height: 16px; }
   .nav-item .nav-label { }
   #sidebar.collapsed .nav-label { display: none; }
   #sidebar.collapsed .nav-item { padding: 10px; justify-content: center; border-left: none; border-right: 3px solid transparent; }
@@ -858,8 +935,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     position: fixed;
     bottom: 24px;
     right: 24px;
-    background: var(--red);
-    color: #fff;
+    background: var(--card);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--muted);
     padding: 10px 18px;
     border-radius: 8px;
     font-size: 13px;
@@ -868,8 +947,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   #toast.show { opacity: 1; }
+  #toast[data-type="success"] { border-left-color: var(--green); }
+  #toast[data-type="warn"]    { border-left-color: #eab308; }
+  #toast[data-type="error"]   { border-left-color: var(--red); }
+  #toast[data-type="info"]    { border-left-color: var(--blue); }
 
   /* ── Filter bar ── */
   .filter-bar {
@@ -1098,7 +1184,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .view-all { font-size: 12px; color: var(--blue); cursor: pointer; text-decoration: none; }
   .view-all:hover { text-decoration: underline; }
   .empty-state { text-align: center; padding: 80px 24px; color: var(--muted); }
-  .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
+  .empty-state .icon { width: 48px; height: 48px; margin: 0 auto 16px; color: var(--muted); opacity: 0.5; }
+  .empty-state .icon svg { width: 48px; height: 48px; }
   .empty-state h2 { font-size: 18px; color: var(--text); margin-bottom: 8px; }
 
   /* ── Overview: perf cards ── */
@@ -1314,16 +1401,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <select id="projectSelect"><option value="">— select —</option></select>
   </div>
   <nav class="sb-nav" id="sbNav">
-    <div class="nav-item active" data-page="overview"><span class="nav-icon">📊</span><span class="nav-label">Overview</span></div>
-    <div class="nav-item" data-page="items"><span class="nav-icon">🗂</span><span class="nav-label">Items</span></div>
-    <div class="nav-item" data-page="gantt"><span class="nav-icon">📅</span><span class="nav-label">Gantt</span></div>
-    <div class="nav-item" data-page="sessions"><span class="nav-icon">📋</span><span class="nav-label">Sessions</span></div>
-    <div class="nav-item" data-page="cycles"><span class="nav-icon">🔄</span><span class="nav-label">Cycles</span></div>
-    <div class="nav-item" data-page="file-changes"><span class="nav-icon">📁</span><span class="nav-label">File Changes</span></div>
+    <div class="nav-item active" data-page="overview"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="10" width="3" height="8" rx="0.5"/><rect x="8.5" y="6" width="3" height="12" rx="0.5"/><rect x="15" y="2" width="3" height="16" rx="0.5"/></svg></span><span class="nav-label">Overview</span></div>
+    <div class="nav-item" data-page="items"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 5h13M3.5 10h13M3.5 15h13"/><circle cx="1" cy="5" r="0.5" fill="currentColor"/><circle cx="1" cy="10" r="0.5" fill="currentColor"/><circle cx="1" cy="15" r="0.5" fill="currentColor"/></svg></span><span class="nav-label">Items</span></div>
+    <div class="nav-item" data-page="gantt"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="14" rx="2"/><path d="M6.5 2v3M13.5 2v3M2.5 8h15"/><circle cx="7" cy="12" r="1" fill="currentColor"/><circle cx="10" cy="12" r="1" fill="currentColor"/><circle cx="13" cy="12" r="1" fill="currentColor"/></svg></span><span class="nav-label">Gantt</span></div>
+    <div class="nav-item" data-page="chains"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3a1.5 1.5 0 0 1 1.5-1.5h3.879a1.5 1.5 0 0 1 1.06.44l3.122 3.12a1.5 1.5 0 0 1 .44 1.06V15.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 4.5 15.5v-12z"/><path d="M8 7h4M8 10.5h4M8 14h2"/><circle cx="6" cy="7" r="0.75" fill="currentColor"/><circle cx="6" cy="10.5" r="0.75" fill="currentColor"/><circle cx="6" cy="14" r="0.75" fill="currentColor"/></svg></span><span class="nav-label">Chains</span></div>
+    <div class="nav-item" data-page="sessions"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h7l4 4v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M12 3v4h4M7 9h6M7 12h6M7 15h4"/></svg></span><span class="nav-label">Sessions</span></div>
+    <div class="nav-item" data-page="cycles"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/><path d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/></svg></span><span class="nav-label">Cycles</span></div>
+    <div class="nav-item" data-page="file-changes"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6a2 2 0 0 1 2-2h3.172a2 2 0 0 1 1.414.586l1.414 1.414H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6z"/></svg></span><span class="nav-label">File Changes</span></div>
   </nav>
   <div class="sb-footer">
     <button class="collapse-btn" id="collapseBtn">
-      <span>◀</span><span class="collapse-label"> Collapse</span>
+      <span><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 16l-5-6 5-6" stroke-width="2"/></svg></span><span class="collapse-label"> Collapse</span>
     </button>
   </div>
 </aside>
@@ -1332,9 +1420,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <div id="app">
   <div class="topbar">
     <div class="topbar-left">
-      <button id="hamburgerBtn" aria-label="Open navigation">☰</button>
+      <button id="hamburgerBtn" aria-label="Open navigation"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button>
       <span class="page-title" id="pageTitle">Overview</span>
-      <span id="fetchSpinner" style="display:none;color:var(--muted);font-size:12px">⟳ Refreshing…</span>
+      <span id="fetchSpinner" style="display:none;color:var(--muted);font-size:12px"><svg class="spinning" width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/></svg> Refreshing…</span>
     </div>
     <div class="topbar-right">
       <div class="topbar-meta">
@@ -1345,14 +1433,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         <div class="toggle-switch on" id="arSwitch"></div>
         <span style="font-size:12px;color:var(--muted)">Auto</span>
       </div>
-      <button class="run-now-btn" id="runNowBtn" title="Manually trigger the PDCA cron cycle now">▶ Run Now</button>
-      <button class="refresh-btn" id="refreshBtn">⟳ Refresh</button>
+      <button class="run-now-btn" id="runNowBtn" title="Manually trigger the PDCA cron cycle now"><svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor" style="vertical-align:middle"><path d="M6.3 2.84A1.5 1.5 0 0 0 4 4.11v11.78a1.5 1.5 0 0 0 2.3 1.27l9.344-5.891a1.5 1.5 0 0 0 0-2.538L6.3 2.84z"/></svg> Run Now</button>
+      <button class="refresh-btn" id="refreshBtn"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/></svg> Refresh</button>
       <a href="/logout" style="font-size:12px;color:#64748b;text-decoration:none;padding:6px 10px;border:1px solid #2d3148;border-radius:6px;white-space:nowrap;" onmouseover="this.style.color='#e2e8f0';this.style.borderColor='#64748b'" onmouseout="this.style.color='#64748b';this.style.borderColor='#2d3148'">Sign out</a>
     </div>
   </div>
   <div id="pageContent">
     <div class="empty-state">
-      <div class="icon">📊</div>
+      <div class="icon"><svg width="48" height="48" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="10" width="3" height="8" rx="0.5"/><rect x="8.5" y="6" width="3" height="12" rx="0.5"/><rect x="15" y="2" width="3" height="16" rx="0.5"/></svg></div>
       <h2>Select a project to get started</h2>
       <p>Choose a project from the sidebar dropdown.</p>
     </div>
@@ -1371,6 +1459,41 @@ function apiFetch(url) {
   });
 }
 
+// ── SVG Icon constants ─────────────────────────────────────────────────────────
+const ICONS = {
+  overview:    '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="10" width="3" height="8" rx="0.5"/><rect x="8.5" y="6" width="3" height="12" rx="0.5"/><rect x="15" y="2" width="3" height="16" rx="0.5"/></svg>',
+  overview14:  '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="10" width="3" height="8" rx="0.5"/><rect x="8.5" y="6" width="3" height="12" rx="0.5"/><rect x="15" y="2" width="3" height="16" rx="0.5"/></svg>',
+  overview48:  '<svg width="48" height="48" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="10" width="3" height="8" rx="0.5"/><rect x="8.5" y="6" width="3" height="12" rx="0.5"/><rect x="15" y="2" width="3" height="16" rx="0.5"/></svg>',
+  items:       '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 5h13M3.5 10h13M3.5 15h13"/><circle cx="1" cy="5" r="0.5" fill="currentColor"/><circle cx="1" cy="10" r="0.5" fill="currentColor"/><circle cx="1" cy="15" r="0.5" fill="currentColor"/></svg>',
+  gantt:       '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="14" rx="2"/><path d="M6.5 2v3M13.5 2v3M2.5 8h15"/><circle cx="7" cy="12" r="1" fill="currentColor"/><circle cx="10" cy="12" r="1" fill="currentColor"/><circle cx="13" cy="12" r="1" fill="currentColor"/></svg>',
+  chains:      '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3a1.5 1.5 0 0 1 1.5-1.5h3.879a1.5 1.5 0 0 1 1.06.44l3.122 3.12a1.5 1.5 0 0 1 .44 1.06V15.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 4.5 15.5v-12z"/><path d="M8 7h4M8 10.5h4M8 14h2"/><circle cx="6" cy="7" r="0.75" fill="currentColor"/><circle cx="6" cy="10.5" r="0.75" fill="currentColor"/><circle cx="6" cy="14" r="0.75" fill="currentColor"/></svg>',
+  chains48:    '<svg width="48" height="48" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3a1.5 1.5 0 0 1 1.5-1.5h3.879a1.5 1.5 0 0 1 1.06.44l3.122 3.12a1.5 1.5 0 0 1 .44 1.06V15.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 4.5 15.5v-12z"/><path d="M8 7h4M8 10.5h4M8 14h2"/><circle cx="6" cy="7" r="0.75" fill="currentColor"/><circle cx="6" cy="10.5" r="0.75" fill="currentColor"/><circle cx="6" cy="14" r="0.75" fill="currentColor"/></svg>',
+  sessions:    '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h7l4 4v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M12 3v4h4M7 9h6M7 12h6M7 15h4"/></svg>',
+  cycles:      '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/><path d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/></svg>',
+  cycles14:    '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/><path d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/></svg>',
+  fileChanges: '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6a2 2 0 0 1 2-2h3.172a2 2 0 0 1 1.414.586l1.414 1.414H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6z"/></svg>',
+  refresh:     '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/><path d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/></svg>',
+  play:        '<svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path d="M6.3 2.84A1.5 1.5 0 0 0 4 4.11v11.78a1.5 1.5 0 0 0 2.3 1.27l9.344-5.891a1.5 1.5 0 0 0 0-2.538L6.3 2.84z"/></svg>',
+  checkCircle: '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="8"/><path d="M6.5 10l2.5 2.5 4.5-4.5"/></svg>',
+  checkCircle14:'<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="8"/><path d="M6.5 10l2.5 2.5 4.5-4.5"/></svg>',
+  warning:     '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3L18 17H2L10 3z"/><path d="M10 8v4M10 14.5v.5"/></svg>',
+  warning48:   '<svg width="48" height="48" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3L18 17H2L10 3z"/><path d="M10 8v4M10 14.5v.5"/></svg>',
+  xCircle:     '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="8"/><path d="M7 7l6 6M13 7l-6 6"/></svg>',
+  clock:       '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="8"/><path d="M10 5v5l3 3"/></svg>',
+  checkSmall:  '<svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10l5 5 7-8"/></svg>',
+  chevronLeft: '<svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 16l-5-6 5-6" stroke-width="2"/></svg>',
+  chevronDown: '<svg width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8l5 5 5-5"/></svg>',
+  grid:        '<svg width="10" height="10" viewBox="0 0 20 20" fill="currentColor" opacity="0.4"><rect x="2" y="2" width="7" height="7" rx="1"/><rect x="11" y="2" width="7" height="7" rx="1"/><rect x="2" y="11" width="7" height="7" rx="1"/><rect x="11" y="11" width="7" height="7" rx="1"/></svg>'
+};
+
+// ── Toast icon map ──────────────────────────────────────────────────────────────
+const TOAST_ICONS = {
+  success: ICONS.checkCircle,
+  warn:    ICONS.warning,
+  error:   ICONS.xCircle,
+  info:    '<svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="8"/><path d="M10 8v0M10 14v-3.5"/></svg>'
+};
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentProject = null;
 let currentPage = 'overview';
@@ -1381,6 +1504,7 @@ let countdownSecs = 60;
 
 const PAGE_TITLES = {
   overview: 'Overview', items: 'Items',
+  chains: 'Chains',
   sessions: 'Sessions',
   cycles: 'Cycles', 'file-changes': 'File Changes'
 };
@@ -1395,29 +1519,41 @@ function fmt(v, fallback) {
   if (fallback === undefined) fallback = '—';
   return (v === null || v === undefined || v === '') ? fallback : v;
 }
+function parseDbDate(v) {
+  if (!v) return null;
+  const raw = String(v).trim();
+  if (!raw) return null;
+  const hasZone = /(?:Z|[+-]\d{2}:\d{2})$/.test(raw);
+  const iso = raw.includes('T')
+    ? raw + (hasZone ? '' : 'Z')
+    : raw.replace(' ', 'T') + (hasZone ? '' : 'Z');
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? null : d;
+}
 function fmtDate(v) {
   if (!v) return '—';
-  const d = new Date(v);
+  const d = parseDbDate(v);
   if (isNaN(d)) return v;
   return d.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'2-digit' })
     + ' ' + d.toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', hour12:false });
 }
 function fmtDateShort(v) {
   if (!v) return '—';
-  const d = new Date(v);
+  const d = parseDbDate(v);
   if (isNaN(d)) return v;
   return d.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'2-digit' });
 }
 function timeAgo(str) {
   if (!str) return '—';
-  // SQLite stores without 'Z'; treat as UTC
-  const secs = Math.floor((Date.now() - new Date(str.includes('T') ? str + (str.endsWith('Z') ? '' : 'Z') : str + 'T00:00:00Z').getTime()) / 1000);
+  const d = parseDbDate(str);
+  if (!d) return fmtDate(str);
+  const secs = Math.floor((Date.now() - d.getTime()) / 1000);
   if (isNaN(secs) || secs < 0) return fmtDate(str);
   if (secs < 60) return 'just now';
   if (secs < 3600) return Math.floor(secs/60) + 'm ago';
   if (secs < 86400) return Math.floor(secs/3600) + 'h ago';
   if (secs < 604800) return Math.floor(secs/86400) + 'd ago';
-  return new Date(str).toLocaleDateString();
+  return d.toLocaleDateString();
 }
 function timeAgoCell(v) {
   if (!v) return '<span style="color:var(--muted)">—</span>';
@@ -1462,11 +1598,13 @@ function phaseBadge(p) {
   return '<span class="badge ' + (m[p]||'badge-plan') + '">' + esc(p||'—') + '</span>';
 }
 
-function showToast(msg, duration) {
-  const t = $('toast');
-  t.textContent = msg;
+function showToast(msg, duration, type) {
+  var icon = type && TOAST_ICONS[type] ? '\x3cspan style="display:inline-flex;vertical-align:middle;margin-right:6px">' + TOAST_ICONS[type] + '\x3c/span>' : '';
+  var t = $('toast');
+  t.innerHTML = icon + esc(msg);
   t.classList.add('show');
-  setTimeout(() => t.classList.remove('show'), duration || 4000);
+  t.dataset.type = type || 'info';
+  setTimeout(() => { t.classList.remove('show'); delete t.dataset.type; }, duration || 4000);
 }
 
 function setFetching(on) {
@@ -1555,18 +1693,18 @@ $('refreshBtn').addEventListener('click', () => {
 $('runNowBtn').addEventListener('click', async () => {
   const btn = $('runNowBtn');
   btn.disabled = true;
-  btn.textContent = '⟳ Running…';
+  btn.innerHTML = '\x3csvg class="spinning" width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle">\x3cpath d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/>\x3cpath d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/>\x3cpath d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/>\x3cpath d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/>\x3c/svg> Running…';
   try {
     const res = await fetch('/api/trigger-cycle', { method: 'POST' });
     const data = await res.json();
     const summary = data.lines.slice(-6).join(' · ') || 'Cycle complete';
-    showToast(data.ok ? '✅ ' + summary : '⚠️ ' + summary, data.ok ? 3500 : 5000);
+    showToast(summary, data.ok ? 3500 : 5000, data.ok ? 'success' : 'warn');
     if (currentProject) loadPage(currentPage);
   } catch (e) {
-    showToast('❌ Failed to trigger cycle: ' + e.message, 5000);
+    showToast('Failed to trigger cycle: ' + e.message, 5000, 'error');
   } finally {
     btn.disabled = false;
-    btn.textContent = '▶ Run Now';
+    btn.innerHTML = ICONS.play + ' Run Now';
   }
 });
 
@@ -1579,17 +1717,17 @@ async function queueItem(evt, itemId) {
     const res = await fetch('/api/items/' + itemId + '/queue', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
-      showToast('⏳ #' + itemId + ' queued — agent will pick it up shortly');
+      showToast('#' + itemId + ' queued — agent will pick it up shortly', 4000, 'info');
       if (currentProject) setTimeout(() => loadPage(currentPage), 800);
     } else {
-      showToast('⚠️ ' + data.message, 4000);
+      showToast(data.message, 4000, 'warn');
       btn.disabled = false;
-      btn.textContent = '▶';
+      btn.innerHTML = ICONS.play;
     }
   } catch (e) {
-    showToast('❌ ' + e.message, 5000);
+    showToast(e.message, 5000, 'error');
     btn.disabled = false;
-    btn.textContent = '▶';
+    btn.innerHTML = ICONS.play;
   }
 }
 
@@ -1603,7 +1741,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
 
 function navigateTo(page) {
   if (!currentProject && page !== 'overview') {
-    showToast('Select a project first');
+    showToast('Select a project first', 4000, 'info');
     return;
   }
   currentPage = page;
@@ -1635,7 +1773,7 @@ async function loadProjects() {
       onProjectChange();
     }
   } catch(e) {
-    showToast('Failed to load projects');
+    showToast('Failed to load projects', 4000, 'error');
   }
 }
 
@@ -1671,6 +1809,10 @@ async function loadPage(page) {
       const data = await apiFetch('/api/items?project=' + p);
       cache.items = data;
       renderItemsPage(data);
+    } else if (page === 'chains') {
+      const data = await apiFetch('/api/chains?project=' + p);
+      cache.chains = data;
+      renderChainsPage(data);
     } else if (page === 'sessions') {
       const data = await apiFetch('/api/sessions?project=' + p);
       cache.sessions = data;
@@ -1691,8 +1833,8 @@ async function loadPage(page) {
     updateLastUpdated();
     if (autoRefresh) { countdownSecs = 60; }
   } catch(e) {
-    showToast('Failed to load data');
-    $('pageContent').innerHTML = '<div class="empty-state"><div class="icon">⚠️</div><h2>Error loading data</h2><p>' + esc(e.message) + '</p></div>';
+    showToast('Failed to load data', 4000, 'error');
+    $('pageContent').innerHTML = '<div class="empty-state"><div class="icon">' + ICONS.warning48 + '</div><h2>Error loading data</h2><p>' + esc(e.message) + '</p></div>';
   } finally {
     setFetching(false);
   }
@@ -1787,7 +1929,7 @@ function makeColToggleDropdown(tableId, cols, onToggle) {
     '<label><input type="checkbox" data-col="' + c.key + '" ' + (vis[c.key] ? 'checked' : '') + '> ' + esc(c.label) + '</label>'
   ).join('');
   const html = '<div style="position:relative;display:inline-block">'
-    + '<button class="col-toggle-btn" onclick="this.nextSibling.classList.toggle(\\'open\\')">Columns ▾</button>'
+    + '<button class="col-toggle-btn" onclick="this.nextSibling.classList.toggle(\\'open\\')">Columns ' + ICONS.chevronDown + '</button>'
     + '<div class="col-dropdown" id="coldrop-' + tableId + '">' + items + '</div>'
     + '</div>';
   return html;
@@ -1888,14 +2030,19 @@ function renderOverview(perf, items, cycles) {
   const sevenDaysAgo = Date.now() - 7 * 86400 * 1000;
   const doneItems = items.filter(i => {
     if (i.status !== 'complete' || !i.completed_at) return false;
-    const raw = i.completed_at.trim(); const iso = raw.replace(' ', 'T') + (raw.endsWith('Z') ? '' : 'Z'); const ts = new Date(iso).getTime();
+    const dt = parseDbDate(i.completed_at);
+    const ts = dt ? dt.getTime() : NaN;
     return !isNaN(ts) && ts >= sevenDaysAgo;
-  }).sort((a, b) => new Date(b.completed_at) - new Date(a.completed_at));
+  }).sort((a, b) => {
+    const bt = parseDbDate(b.completed_at);
+    const at = parseDbDate(a.completed_at);
+    return (bt ? bt.getTime() : 0) - (at ? at.getTime() : 0);
+  });
 
   const doneHtml = doneItems.length
     ? '<div class="done-list">' + doneItems.map(i =>
         '<div class="done-item">'
-        + '<span class="done-check">✅</span>'
+        + '<span class="done-check">' + ICONS.checkCircle + '</span>'
         + '<span class="done-title">' + esc(i.title) + '</span>'
         + '<span class="done-meta" title="' + esc(fmtDate(i.completed_at)) + '">' + esc(timeAgo(i.completed_at)) + (i.agent_assigned ? '   ' + esc(i.agent_assigned) : '') + '</span>'
         + '</div>'
@@ -1917,12 +2064,12 @@ function renderOverview(perf, items, cycles) {
     : '<div style="padding:16px;color:var(--muted);font-size:13px">No cycle activity yet.</div>';
 
   $('pageContent').innerHTML =
-    '<div class="section"><div class="section-header"><div class="section-title">📊 Project Performance</div></div>'
+    '<div class="section"><div class="section-header"><div class="section-title"><span style="display:inline-flex;vertical-align:middle;margin-right:6px">' + ICONS.overview14 + '</span>Project Performance</div></div>'
     + '<div class="perf-projects">' + (perfCards || '<div class="no-data">No performance data.</div>') + '</div></div>'
-    + '<div class="section"><div class="section-header"><div class="section-title">✅ Done This Week <span class="count">' + doneItems.length + '</span></div>'
+    + '<div class="section"><div class="section-header"><div class="section-title"><span style="display:inline-flex;vertical-align:middle;margin-right:6px">' + ICONS.checkCircle14 + '</span>Done This Week <span class="count">' + doneItems.length + '</span></div>'
     + '<a class="view-all" onclick="navigateTo(\\'items\\')">View all →</a></div>'
     + '<div class="table-wrap">' + doneHtml + '</div></div>'
-    + '<div class="section"><div class="section-header"><div class="section-title">🔄 Activity Feed <span class="count">' + feedCycles.length + '</span></div>'
+    + '<div class="section"><div class="section-header"><div class="section-title"><span style="display:inline-flex;vertical-align:middle;margin-right:6px">' + ICONS.cycles14 + '</span>Activity Feed <span class="count">' + feedCycles.length + '</span></div>'
     + '<a class="view-all" onclick="navigateTo(\\'cycles\\')">View all →</a></div>'
     + '<div class="table-wrap">' + feedHtml + '</div></div>';
 }
@@ -2380,7 +2527,7 @@ function renderItemsPage(rawData) {
   const html =
     '<div class="tl-filter-bar">'
     + '<button class="tl-filter-btn'+(itemsTab==='all'?' tl-active':'')+'" data-tab="all" onclick="setItemsTab(\\'all\\')" title="Show all items">'
-    + '<span style="font-size:10px">⬜</span> All<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
+    + '<span style="font-size:10px;display:inline-flex;vertical-align:middle">' + ICONS.grid + '</span> All<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
     + '<button class="tl-filter-btn'+(itemsTab==='not-started'?' tl-active':'')+'" data-tab="not-started" onclick="setItemsTab(\\'not-started\\')" title="Open — not started yet, no blocker">'
     + '<span class="tl-dot tl-gray" style="font-size:10px">●</span> To Be Started<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
     + '<button class="tl-filter-btn'+(itemsTab==='queued'?' tl-active':'')+'" data-tab="queued" onclick="setItemsTab(\\'queued\\')" title="Blocked — queued behind a dependency">'
@@ -2548,13 +2695,13 @@ function redrawItems() {
       ? ' <span class="blocks-badge" title="This item must complete before '+blocksCount+' other item'+(blocksCount>1?'s':'')+' can start">⬆ blocks '+blocksCount+'</span>'
       : '';
     const waitingTag = blockedByTitle
-      ? ' <span class="waiting-badge" title="Waiting for: '+esc(blockedByTitle)+'">⏳ waiting for #'+item.depends_on+'</span>'
+      ? ' <span class="waiting-badge" title="Waiting for: '+esc(blockedByTitle)+'">' + ICONS.clock + ' waiting for #'+item.depends_on+'</span>'
       : '';
     const triggerBtn = canQueue
-      ? '<button class="row-trigger-btn" onclick="queueItem(event,'+item.id+')" title="Queue this item now">▶</button>'
+      ? '<button class="row-trigger-btn" onclick="queueItem(event,'+item.id+')" title="Queue this item now">' + ICONS.play + '</button>'
       : item.status==='in-progress'
         ? '<button class="log-btn" style="padding:2px 8px;font-size:11px" onclick="event.stopPropagation();openLogModal('+item.id+',\\''+esc(item.title).replace(/\\'/g,'').slice(0,40)+'\\')" title="View live logs">Logs</button>'
-      : '<span style="color:var(--muted);font-size:11px">'+(item.status==='queued'?'⏳':item.status==='complete'?'✓':'—')+'</span>';
+      : '<span style="color:var(--muted);font-size:11px;display:inline-flex;vertical-align:middle">'+(item.status==='queued'?ICONS.clock:item.status==='complete'?ICONS.checkSmall:'—')+'</span>';
     return '<tr class="'+(hasDetail?'clickable-row':'')+'" '+(hasDetail?'data-expand="'+eid+'"':'')+' title="'+(hasDetail?'Click to expand':'')+'">'
       + '<td style="text-align:center;padding:10px 6px">' + itemTrafficDot(item) + '</td>'
       + '<td class="mono">#'+item.id+'</td>'
@@ -2602,7 +2749,7 @@ function redrawItems() {
         + statusBadge(item._is_blocked ? 'blocked' : item.status)
         + ' ' + priorityBadge(item.priority)
         + ' ' + phaseBadge(item.phase)
-        + (canQueue ? ' <button class="row-trigger-btn" onclick="event.stopPropagation();queueItem(event,'+item.id+')" title="Queue this item now">▶ Queue</button>' : '')
+        + (canQueue ? ' <button class="row-trigger-btn" onclick="event.stopPropagation();queueItem(event,'+item.id+')" title="Queue this item now">' + ICONS.play + ' Queue</button>' : '')
         + '</div>'
         + '<div class="item-card-meta">'
         + (item.category ? '<span class="item-card-meta-item"><span class="item-card-meta-label">cat</span>&nbsp;'+esc(item.category)+'</span>' : '')
@@ -2636,6 +2783,59 @@ function redrawItems() {
 function toggleItemCard(id) {
   var el = document.getElementById(id);
   if (el) el.classList.toggle('open');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAGE: Chains
+// ─────────────────────────────────────────────────────────────────────────────
+function renderChainsPage(payload) {
+  const data = payload && Array.isArray(payload.chains) ? payload.chains : [];
+  if (!payload || payload.supported === false) {
+    const parts = [];
+    if (payload && payload.missing_columns && payload.missing_columns.length) {
+      parts.push('Missing columns: ' + payload.missing_columns.join(', '));
+    }
+    if (payload && payload.missing_tables && payload.missing_tables.length) {
+      parts.push('Missing tables: ' + payload.missing_tables.join(', '));
+    }
+    $('pageContent').innerHTML = '<div class="empty-state">'
+      + '<div class="icon">' + ICONS.chains48 + '</div>'
+      + '<h2>Chains view is waiting on the PDCA v2 migration</h2>'
+      + '<p>' + esc(parts.join(' | ') || 'Chain schema has not been applied yet.') + '</p>'
+      + '</div>';
+    return;
+  }
+
+  if (!data.length) {
+    $('pageContent').innerHTML = '<div class="empty-state">'
+      + '<div class="icon">' + ICONS.chains48 + '</div>'
+      + '<h2>No chains found for this project</h2>'
+      + '<p>Once PDCA v2 items are created, chain summaries will appear here.</p>'
+      + '</div>';
+    return;
+  }
+
+  $('pageContent').innerHTML = '<div class="result-count">Showing ' + data.length + ' chain' + (data.length === 1 ? '' : 's') + '</div>'
+    + '<div class="table-wrap"><div class="table-toolbar">' + makeDensityBtn('tbl-chains') + '</div>'
+    + '<div class="table-scroll"><table id="tbl-chains">'
+    + '<thead><tr>'
+    + '<th>Chain Root</th><th>Title</th><th>Status</th><th>Iteration</th><th>Check</th><th>Progress</th><th>Last Activity</th>'
+    + '</tr></thead><tbody>'
+    + data.map(function(row) {
+      const score = row.latest_check_score || 0;
+      const progress = Math.max(0, Math.min(100, row.total_items ? Math.round((row.completed_items / row.total_items) * 100) : 0));
+      return '<tr>'
+        + '<td class="mono">#' + esc(row.chain_root_id) + '</td>'
+        + '<td>' + esc(row.root_title || '—') + (row.escalated_to ? ' <span class="waiting-badge">escalated</span>' : '') + '</td>'
+        + '<td>' + statusBadge(row.chain_status || 'open') + '</td>'
+        + '<td class="dim">' + esc(String(row.max_iteration || 1)) + '</td>'
+        + '<td>' + outcomeBadge(row.latest_check_verdict) + (row.latest_check_verdict ? ' <span class="dim">' + esc(String(score)) + '/100</span>' : '') + '</td>'
+        + '<td class="dim">' + esc(String(progress)) + '%</td>'
+        + '<td class="dim">' + timeAgoCell(row.last_activity_at) + '</td>'
+        + '</tr>';
+    }).join('')
+    + '</tbody></table></div></div>';
+  applyDensity('tbl-chains');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2940,7 +3140,7 @@ function redrawFC() {
 // Restore page from URL on load / refresh
 try {
   (function initFromUrl() {
-    var VALID_PAGES = ['overview', 'items', 'gantt', 'sessions', 'cycles', 'file-changes'];
+    var VALID_PAGES = ['overview', 'items', 'gantt', 'chains', 'sessions', 'cycles', 'file-changes'];
     var rawPath = window.location.pathname.slice(1) || 'overview';
     var page = VALID_PAGES.indexOf(rawPath) !== -1 ? rawPath : 'overview';
     currentPage = page;
