@@ -16,7 +16,7 @@ let db;
 try {
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
-  db.exec("CREATE TABLE IF NOT EXISTS pdca_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, line TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))");
+  db.exec("CREATE TABLE IF NOT EXISTS pdca_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, line TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')))");
 
   // ── PDCA v2 migration: chain columns + pdca_projects table ──────────────────
   (function runMigrations() {
@@ -318,7 +318,7 @@ app.post('/api/items/:id/queue', (req, res) => {
     if (!['open'].includes(row.status)) {
       return res.json({ ok: false, message: `Item is already ${row.status} — cannot queue` });
     }
-    db.prepare("UPDATE pdca_items SET status='queued', started_at=datetime('now') WHERE id=?").run(id);
+    db.prepare("UPDATE pdca_items SET status='queued', started_at=datetime('now', 'localtime') WHERE id=?").run(id);
 
     // Kick the queue processor in the background (non-blocking)
     const { spawn } = require('child_process');
@@ -367,7 +367,7 @@ app.post('/api/items/:id/logs', express.json(), (req, res) => {
     if (!line) return res.status(400).json({ error: 'line is required' });
     const item = db.prepare('SELECT id FROM pdca_items WHERE id = ?').get(id);
     if (!item) return res.status(404).json({ error: 'Item not found' });
-    db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now'))").run(id, line);
+    db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now', 'localtime'))").run(id, line);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1557,7 +1557,7 @@ function parseDbDate(v) {
   if (!v) return null;
   const raw = String(v).trim();
   if (!raw) return null;
-  // SQLite datetime format: '2025-04-14 10:30:00' (local time)
+  // SQLite datetime format: '2025-04-14 10:30:00' (IST local time, stored via localtime)
   // Don't append 'Z' - treat as local time by using direct Date constructor
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(raw)) {
     const d = new Date(raw.replace(' ', 'T'));
