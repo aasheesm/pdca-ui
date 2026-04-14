@@ -14,7 +14,7 @@ const AUTH_HASH = '$2a$14$WDKpUrU7Xiu.QWRb4ZFq5.OQjIGCu6HmAl8pBP3Zu9AKhoXrniNsS'
 let db;
 
 try {
-  db = new Database(DB_PATH, { readonly: true });
+  db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
 } catch (err) {
   console.error('Failed to open database:', err.message);
