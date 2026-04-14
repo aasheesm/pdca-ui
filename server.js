@@ -1781,7 +1781,7 @@ function renderOverview(perf, items, cycles) {
 // PAGE: Items (merged — Pending / All / Blocked tabs)
 // ─────────────────────────────────────────────────────────────────────────────
 let itemsFilter = { search:'', priority:[], phase:[], status:[], agent:'' };
-let itemsTab = 'all'; // 'all' | 'pending' | 'complete' | 'blocked' | 'queued' | 'not-started' | 'dropped'
+let itemsTab = 'not-started'; // 'all' | 'pending' | 'complete' | 'blocked' | 'queued' | 'not-started' | 'dropped'
 let itemsPage = 1;
 let itemsPageSize = 10;
 var ganttShowCritical = false;
