@@ -16,6 +16,7 @@ let db;
 try {
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
+  db.exec("CREATE TABLE IF NOT EXISTS pdca_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, line TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))");
 } catch (err) {
   console.error('Failed to open database:', err.message);
   process.exit(1);
@@ -108,16 +109,26 @@ app.get('/api/items', (req, res) => {
     const { project } = req.query;
     if (!project) return res.status(400).json({ error: 'project param required' });
     const rows = db.prepare(`
-      SELECT *,
-        CASE priority
+      SELECT i.*,
+        CASE i.priority
           WHEN 'critical' THEN 1
           WHEN 'high'     THEN 2
           WHEN 'medium'   THEN 3
           ELSE 4
-        END AS priority_rank
-      FROM pdca_items
-      WHERE project_id = ?
-      ORDER BY priority_rank, created_at
+        END AS priority_rank,
+        COALESCE(dep.blocks_count, 0) AS blocks_count,
+        blocker.title AS blocked_by_title
+      FROM pdca_items i
+      LEFT JOIN (
+        SELECT depends_on, COUNT(*) AS blocks_count
+        FROM pdca_items
+        WHERE status IN ('open','queued','in-progress') AND depends_on IS NOT NULL
+        GROUP BY depends_on
+      ) dep ON dep.depends_on = i.id
+      LEFT JOIN pdca_items blocker ON blocker.id = i.depends_on
+        AND blocker.status != 'complete'
+      WHERE i.project_id = ?
+      ORDER BY priority_rank, i.created_at
     `).all(project);
     res.json(rows);
   } catch (err) {
@@ -238,6 +249,82 @@ app.post('/api/trigger-cycle', (_req, res) => {
   });
 });
 
+// ── Log Endpoints ────────────────────────────────────────────────────────────
+
+app.post('/api/items/:id/logs', express.json(), (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { line } = req.body;
+    if (!line) return res.status(400).json({ error: 'line is required' });
+    const item = db.prepare('SELECT id FROM pdca_items WHERE id = ?').get(id);
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+    db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now'))").run(id, line);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/items/:id/logs/stream', (req, res) => {
+  const id = parseInt(req.params.id);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let lastId = 0;
+
+  function sendLogs() {
+    try {
+      const item = db.prepare('SELECT status, phase FROM pdca_items WHERE id = ?').get(id);
+      if (!item) {
+        res.write('event: close\ndata: {"reason":"not_found"}\n\n');
+        return cleanup();
+      }
+      const rows = db.prepare(
+        'SELECT id, line, created_at FROM pdca_logs WHERE item_id = ? AND id > ? ORDER BY id ASC'
+      ).all(id, lastId);
+      rows.forEach(function(row) {
+        lastId = row.id;
+        const payload = JSON.stringify({ id: row.id, line: row.line, ts: row.created_at });
+        res.write('data: ' + payload + '\n\n');
+      });
+      if (item.status !== 'in-progress' && item.status !== 'queued') {
+        if (lastId > 0) {
+          res.write('event: close\ndata: {"reason":"completed","status":"' + item.status + '"}\n\n');
+          return cleanup();
+        }
+      }
+    } catch (err) {
+      console.error('SSE error:', err.message);
+    }
+  }
+
+  sendLogs();
+  const interval = setInterval(sendLogs, 2000);
+
+  function cleanup() {
+    clearInterval(interval);
+    try { res.end(); } catch(e) {}
+  }
+
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+});
+
+app.get('/api/items/:id/logs', (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const rows = db.prepare(
+      'SELECT id, line, created_at FROM pdca_logs WHERE item_id = ? ORDER BY id ASC'
+    ).all(id);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Login HTML ────────────────────────────────────────────────────────────────
 
 const LOGIN_HTML = `<!DOCTYPE html>
@@ -321,6 +408,67 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .tl-gray   { color: #64748b; }
   .tl-dark   { color: #374151; }
   .tl-purple { color: #a855f7; }
+
+  /* ── Log Modal ── */
+  #log-modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.75); z-index: 1000;
+    align-items: center; justify-content: center;
+  }
+  #log-modal-overlay.open { display: flex; }
+  #log-modal {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 10px;
+    width: min(860px, 95vw); max-height: 80vh;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.6);
+  }
+  #log-modal-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; border-bottom: 1px solid #21262d; flex-shrink: 0;
+  }
+  #log-modal-title {
+    flex: 1; font-size: 13px; font-weight: 600; color: #e6edf3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #log-modal-live-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.3);
+    border-radius: 12px; color: #22c55e; font-size: 11px; font-weight: 700;
+    padding: 2px 10px; letter-spacing: 0.5px;
+  }
+  #log-modal-live-badge .live-dot {
+    width: 6px; height: 6px; background: #22c55e; border-radius: 50%;
+    animation: livePulse 1.2s ease-in-out infinite;
+  }
+  #log-modal-live-badge.disconnected {
+    background: rgba(100,116,139,0.12); border-color: rgba(100,116,139,0.3); color: #64748b;
+  }
+  #log-modal-live-badge.disconnected .live-dot { background: #64748b; animation: none; }
+  @keyframes livePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  #log-modal-close {
+    background: transparent; border: none; color: #8b949e; cursor: pointer;
+    font-size: 18px; line-height: 1; padding: 2px 6px; border-radius: 4px;
+    transition: color 0.1s, background 0.1s;
+  }
+  #log-modal-close:hover { color: #e6edf3; background: #21262d; }
+  #log-modal-body {
+    flex: 1; overflow-y: auto; padding: 12px 16px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+    font-size: 12px; line-height: 1.6; color: #8b949e; background: #0d1117;
+  }
+  .log-line { display: flex; gap: 10px; padding: 1px 0; }
+  .log-ts { color: #484f58; white-space: nowrap; flex-shrink: 0; }
+  .log-text { color: #c9d1d9; word-break: break-all; }
+  .log-empty { color: #484f58; font-style: italic; }
+  #log-modal-footer {
+    padding: 8px 16px; border-top: 1px solid #21262d; font-size: 11px; color: #484f58;
+    flex-shrink: 0; display: flex; gap: 12px; align-items: center;
+  }
+  .log-btn {
+    background: transparent; border: 1px solid #30363d; border-radius: 5px;
+    color: #8b949e; cursor: pointer; font-size: 11px; padding: 3px 10px; transition: all 0.1s;
+  }
+  .log-btn:hover { border-color: #58a6ff; color: #58a6ff; }
 
   /* ── Tabs ── */
   .tab-bar {
@@ -921,6 +1069,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .badge-complete    { background: rgba(34,197,94,0.15); color: var(--green); }
   .badge-in-progress { background: rgba(59,130,246,0.15); color: var(--blue); }
   .badge-queued      { background: rgba(168,85,247,0.15); color: var(--purple); }
+  .blocks-badge  { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:600; background:rgba(239,68,68,0.15); color:#f87171; vertical-align:middle; }
+  .waiting-badge { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:500; background:rgba(251,191,36,0.12); color:#fbbf24; vertical-align:middle; }
   .badge-open        { background: rgba(100,116,139,0.15); color: var(--muted); }
   .badge-blocked     { background: rgba(239,68,68,0.15); color: var(--red); }
   .badge-cancelled   { background: rgba(100,116,139,0.1); color: var(--muted); text-decoration: line-through; }
@@ -1738,7 +1888,7 @@ function renderOverview(perf, items, cycles) {
   const sevenDaysAgo = Date.now() - 7 * 86400 * 1000;
   const doneItems = items.filter(i => {
     if (i.status !== 'complete' || !i.completed_at) return false;
-    const ts = new Date(i.completed_at.includes('T') ? i.completed_at + (i.completed_at.endsWith('Z') ? '' : 'Z') : i.completed_at + 'T00:00:00Z').getTime();
+    const raw = i.completed_at.trim(); const iso = raw.replace(' ', 'T') + (raw.endsWith('Z') ? '' : 'Z'); const ts = new Date(iso).getTime();
     return !isNaN(ts) && ts >= sevenDaysAgo;
   }).sort((a, b) => new Date(b.completed_at) - new Date(a.completed_at));
 
@@ -2106,8 +2256,18 @@ function renderGanttPage(rawData) {
         var span = el.querySelectorAll('span')[1];
         if (!span) return;
         var onCp = cpActive && cpIds.indexOf(id) !== -1;
-        span.style.color = onCp ? '#fbbf24' : '#e2e8f0';
+        span.style.color = onCp ? '#fbbf24' : (cpActive ? '#475569' : '#e2e8f0');
         span.style.fontWeight = onCp ? '700' : 'normal';
+        el.style.opacity = (!cpActive || onCp) ? '1' : '0.3';
+      });
+    }
+
+    function restoreBars() {
+      document.querySelectorAll('.gantt-bar').forEach(function(g) {
+        var id = parseInt(g.getAttribute('data-id'), 10);
+        var onCp = cpActive && cpIds.indexOf(id) !== -1;
+        var opacity = (!cpActive || onCp) ? '1' : '0.2';
+        g.setAttribute('opacity', opacity);
       });
     }
 
@@ -2150,7 +2310,7 @@ function renderGanttPage(rawData) {
         cpBtn.style.background = cpActive ? '#f59e0b' : 'transparent';
         cpBtn.style.color      = cpActive ? '#000'   : '#f59e0b';
         cpBtn.textContent      = cpActive ? 'Hide Critical Path' : 'Critical Path';
-        restoreArrows(); restoreLabels();
+        restoreArrows(); restoreLabels(); restoreBars();
       });
     }
 
@@ -2382,13 +2542,23 @@ function redrawItems() {
     const hasDetail = item.plan_description || item.actual_description || item.remarks || item.errors_encountered || item.files_modified;
     const files = parseArr(item.files_modified);
     const canQueue = item.status === 'open';
+    const blocksCount = item.blocks_count || 0;
+    const blockedByTitle = item.blocked_by_title || null;
+    const blockerTag = blocksCount > 0
+      ? ' <span class="blocks-badge" title="This item must complete before '+blocksCount+' other item'+(blocksCount>1?'s':'')+' can start">⬆ blocks '+blocksCount+'</span>'
+      : '';
+    const waitingTag = blockedByTitle
+      ? ' <span class="waiting-badge" title="Waiting for: '+esc(blockedByTitle)+'">⏳ waiting for #'+item.depends_on+'</span>'
+      : '';
     const triggerBtn = canQueue
       ? '<button class="row-trigger-btn" onclick="queueItem(event,'+item.id+')" title="Queue this item now">▶</button>'
-      : '<span style="color:var(--muted);font-size:11px">'+(item.status==='queued'?'⏳':item.status==='in-progress'?'⚙':item.status==='complete'?'✓':'—')+'</span>';
+      : item.status==='in-progress'
+        ? '<button class="log-btn" style="padding:2px 8px;font-size:11px" onclick="event.stopPropagation();openLogModal('+item.id+',\\''+esc(item.title).replace(/\\'/g,'').slice(0,40)+'\\')" title="View live logs">Logs</button>'
+      : '<span style="color:var(--muted);font-size:11px">'+(item.status==='queued'?'⏳':item.status==='complete'?'✓':'—')+'</span>';
     return '<tr class="'+(hasDetail?'clickable-row':'')+'" '+(hasDetail?'data-expand="'+eid+'"':'')+' title="'+(hasDetail?'Click to expand':'')+'">'
       + '<td style="text-align:center;padding:10px 6px">' + itemTrafficDot(item) + '</td>'
       + '<td class="mono">#'+item.id+'</td>'
-      + '<td>'+esc(item.title)+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</td>'
+      + '<td>'+esc(item.title)+blockerTag+waitingTag+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</td>'
       + '<td>'+priorityBadge(item.priority)+'</td>'
       + '<td>'+phaseBadge(item.phase)+'</td>'
       + '<td>'+statusBadge(item._is_blocked ? 'blocked' : item.status)+'</td>'
@@ -2798,7 +2968,116 @@ window.addEventListener('popstate', e => {
 
 loadProjects();
 startCountdown();
+
+// ── Log Modal ─────────────────────────────────────────────────────────────────
+
+var _logModalEs = null;
+var _logModalItemId = null;
+var _logAutoScroll = true;
+
+function openLogModal(itemId, title) {
+  _logModalItemId = itemId;
+  _logAutoScroll = true;
+  var overlay = document.getElementById('log-modal-overlay');
+  var titleEl = document.getElementById('log-modal-title');
+  var body = document.getElementById('log-modal-body');
+  var badge = document.getElementById('log-modal-live-badge');
+  var footerCount = document.getElementById('log-modal-footer-count');
+  if (!overlay) return;
+  titleEl.textContent = '#' + itemId + ' ' + title;
+  body.innerHTML = '<div class="log-empty">Connecting...</div>';
+  badge.className = '';
+  badge.innerHTML = '<span class="live-dot"></span> LIVE';
+  if (footerCount) footerCount.textContent = '0 lines';
+  overlay.classList.add('open');
+  document.body.style.overflow = 'hidden';
+
+  if (_logModalEs) { try { _logModalEs.close(); } catch(e) {} _logModalEs = null; }
+
+  var es = new EventSource('/api/items/' + itemId + '/logs/stream');
+  _logModalEs = es;
+  var lineCount = 0;
+
+  es.onmessage = function(e) {
+    try {
+      var data = JSON.parse(e.data);
+      if (lineCount === 0) body.innerHTML = '';
+      lineCount++;
+      var div = document.createElement('div');
+      div.className = 'log-line';
+      var ts = data.ts ? data.ts.replace('T',' ').slice(0,19) : '';
+      div.innerHTML = '<span class="log-ts">' + ts + '</span><span class="log-text">' + escLog(data.line) + '</span>';
+      body.appendChild(div);
+      if (_logAutoScroll) body.scrollTop = body.scrollHeight;
+      if (footerCount) footerCount.textContent = lineCount + ' line' + (lineCount === 1 ? '' : 's');
+    } catch(err) {}
+  };
+
+  es.addEventListener('close', function(e) {
+    badge.className = 'disconnected';
+    try {
+      var d = JSON.parse(e.data);
+      badge.innerHTML = '<span class="live-dot"></span> ' + (d.status || 'DONE').toUpperCase();
+    } catch(ex) {
+      badge.innerHTML = '<span class="live-dot"></span> CLOSED';
+    }
+    if (lineCount === 0) body.innerHTML = '<div class="log-empty">No logs for this item yet.</div>';
+    es.close();
+  });
+
+  es.onerror = function() {
+    badge.className = 'disconnected';
+    badge.innerHTML = '<span class="live-dot"></span> ERR';
+    if (lineCount === 0) body.innerHTML = '<div class="log-empty">Could not connect to log stream.</div>';
+  };
+}
+
+function closeLogModal() {
+  if (_logModalEs) { try { _logModalEs.close(); } catch(e) {} _logModalEs = null; }
+  var overlay = document.getElementById('log-modal-overlay');
+  if (overlay) overlay.classList.remove('open');
+  document.body.style.overflow = '';
+  _logModalItemId = null;
+}
+
+function escLog(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+document.addEventListener('click', function(e) {
+  var overlay = document.getElementById('log-modal-overlay');
+  if (overlay && e.target === overlay) closeLogModal();
+});
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeLogModal();
+});
+
+document.addEventListener('scroll', function(e) {
+  var body = document.getElementById('log-modal-body');
+  if (body && e.target === body) {
+    _logAutoScroll = body.scrollTop + body.clientHeight >= body.scrollHeight - 30;
+  }
+}, true);
+
 </script>
+
+<!-- Log Modal -->
+<div id="log-modal-overlay">
+  <div id="log-modal">
+    <div id="log-modal-header">
+      <div id="log-modal-title">Logs</div>
+      <div id="log-modal-live-badge"><span class="live-dot"></span> LIVE</div>
+      <button id="log-modal-close" onclick="closeLogModal()" title="Close (Esc)">x</button>
+    </div>
+    <div id="log-modal-body"></div>
+    <div id="log-modal-footer">
+      <span id="log-modal-footer-count">0 lines</span>
+      <button class="log-btn" onclick="(function(){var b=document.getElementById('log-modal-body');if(b){b.scrollTop=b.scrollHeight;_logAutoScroll=true;}})()">Scroll to bottom</button>
+      <button class="log-btn" onclick="closeLogModal()">Close</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>`;
 
