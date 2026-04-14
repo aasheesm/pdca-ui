@@ -271,6 +271,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .tl-green  { color: #22c55e; }
   .tl-gray   { color: #64748b; }
   .tl-dark   { color: #374151; }
+  .tl-purple { color: #a855f7; }
 
   /* ── Tabs ── */
   .tab-bar {
@@ -841,6 +842,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .badge-low      { background: rgba(100,116,139,0.15); color: var(--muted); }
   .badge-complete    { background: rgba(34,197,94,0.15); color: var(--green); }
   .badge-in-progress { background: rgba(59,130,246,0.15); color: var(--blue); }
+  .badge-queued      { background: rgba(168,85,247,0.15); color: var(--purple); }
   .badge-open        { background: rgba(100,116,139,0.15); color: var(--muted); }
   .badge-blocked     { background: rgba(239,68,68,0.15); color: var(--red); }
   .badge-cancelled   { background: rgba(100,116,139,0.1); color: var(--muted); text-decoration: line-through; }
@@ -1149,7 +1151,7 @@ function priorityBadge(p) {
   return '<span class="badge ' + (m[p]||'badge-low') + '">' + esc(p||'—') + '</span>';
 }
 function statusBadge(s) {
-  const m = { complete:'badge-complete', 'in-progress':'badge-in-progress', open:'badge-open', blocked:'badge-blocked', cancelled:'badge-cancelled' };
+  const m = { complete:'badge-complete', 'in-progress':'badge-in-progress', queued:'badge-queued', open:'badge-open', blocked:'badge-blocked', cancelled:'badge-cancelled' };
   return '<span class="badge ' + (m[s]||'badge-open') + '">' + esc(s||'—') + '</span>';
 }
 function outcomeBadge(o) {
@@ -1609,6 +1611,7 @@ function deriveBlocked(items) {
 function itemTrafficDot(item) {
   if (item._is_blocked || item.status === 'blocked') return '<span class="tl-dot tl-red" title="Blocked — waiting on dependency">●</span>';
   if (item.status === 'complete') return '<span class="tl-dot tl-green" title="Complete">●</span>';
+  if (item.status === 'queued') return '<span class="tl-dot tl-purple" title="Queued — dispatched, waiting for LLM pickup">●</span>';
   if (item.status === 'in-progress' || item.phase === 'check') return '<span class="tl-dot tl-amber" title="In progress">●</span>';
   if (item.status === 'dropped' || item.status === 'cancelled') return '<span class="tl-dot tl-gray" title="Dropped / cancelled">●</span>';
   return '<span class="tl-dot tl-gray" title="Open — not started">●</span>';
@@ -1997,9 +2000,9 @@ function updateTabStats(data) {
   var tabDefs = {
     'all':         data,
     'not-started': data.filter(function(i){ return i.status === 'open' && !i._is_blocked; }),
-    'queued':      data.filter(function(i){ return i._is_blocked && i.status !== 'complete'; }),
+    'queued':      data.filter(function(i){ return i.status === 'queued' || (i._is_blocked && i.status === 'open'); }),
     'pending':     data.filter(function(i){ return i.status === 'in-progress' && !i._is_blocked; }),
-    'blocked':     data.filter(function(i){ return i._is_blocked; }),
+    'blocked':     data.filter(function(i){ return i._is_blocked && i.status === 'in-progress'; }),
     'complete':    data.filter(function(i){ return i.status === 'complete'; }),
     'dropped':     data.filter(function(i){ return i.status === 'dropped' || i.status === 'cancelled'; }),
   };
@@ -2030,9 +2033,9 @@ function redrawItems() {
   let filtered = data.filter(i => {
     if (itemsTab === 'pending')     return i.status === 'in-progress' && !i._is_blocked;
     if (itemsTab === 'not-started') return i.status === 'open' && !i._is_blocked;
-    if (itemsTab === 'queued')      return i._is_blocked && i.status !== 'complete';
+    if (itemsTab === 'queued')      return i.status === 'queued' || (i._is_blocked && i.status === 'open');
     if (itemsTab === 'complete')    return i.status === 'complete';
-    if (itemsTab === 'blocked')     return i._is_blocked;
+    if (itemsTab === 'blocked')     return i._is_blocked && i.status === 'in-progress';
     if (itemsTab === 'dropped')     return i.status === 'dropped' || i.status === 'cancelled';
     return true; // 'all'
   });
@@ -2075,7 +2078,7 @@ function redrawItems() {
       + '<td>'+esc(item.title)+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</td>'
       + '<td>'+priorityBadge(item.priority)+'</td>'
       + '<td>'+phaseBadge(item.phase)+'</td>'
-      + '<td>'+statusBadge(item.status)+'</td>'
+      + '<td>'+statusBadge(item._is_blocked ? 'blocked' : item.status)+'</td>'
       + '<td class="dim">'+fmt(item.category)+'</td>'
       + '<td class="dim">'+fmt(item.agent_assigned)+'</td>'
       + '<td class="dim">'+fmt(item.estimated_mins)+'</td>'
