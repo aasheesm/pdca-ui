@@ -1939,23 +1939,39 @@ function renderGanttPage(rawData) {
       + '</g>';
   }).join('');
 
-  // Dependency arrows
-  var arrows = order.filter(function(item) {
+  // Dependency arrows — with vertical stagger for parallel arrows from same row
+  var arrowData = order.filter(function(item) {
     return item.depends_on && rowIdx[item.depends_on] !== undefined;
   }).map(function(item) {
     var fi = rowIdx[item.depends_on];
     var fromItem = byId[item.depends_on];
-    var fx = Math.min(svgW - 4, iEndPx(fromItem));
-    var fy = AXIS_H + fi * ROW_H + ROW_H / 2;
-    var txi = iStartPx(item), ty = AXIS_H + rowIdx[item.id] * ROW_H + ROW_H / 2;
-    var mx = (fx + txi) / 2;
-    var col = item._is_blocked ? '#ef4444' : '#4b5563';
-    var dash = item._is_blocked ? '4,3' : 'none';
-    var mid = item._is_blocked ? 'red' : 'gray';
-    return '<path id="garr-' + item.id + '" class="gantt-arrow" data-from="' + item.depends_on + '" data-to="' + item.id + '" data-blocked="' + (item._is_blocked ? '1' : '0') + '"'
-      + ' d="M' + fx + ',' + fy + ' C' + mx + ',' + fy + ' ' + mx + ',' + ty + ' ' + txi + ',' + ty + '"'
-      + ' fill="none" stroke="' + col + '" stroke-width="1.5" stroke-dasharray="' + dash + '" opacity="0.4"'
-      + ' marker-end="url(#arr-' + mid + ')"/>';
+    return {
+      item: item,
+      fi: fi,
+      fx: Math.min(svgW - 4, iEndPx(fromItem)),
+      ti: rowIdx[item.id],
+      txi: iStartPx(item),
+      col: item._is_blocked ? '#ef4444' : '#4b5563',
+      dash: item._is_blocked ? '4,3' : 'none',
+      mid: item._is_blocked ? 'red' : 'gray'
+    };
+  });
+  // Compute per-source-row counts for stagger
+  var _fromCounts = {}, _fromSeq = {};
+  arrowData.forEach(function(a) { _fromCounts[a.fi] = (_fromCounts[a.fi] || 0) + 1; });
+  arrowData.forEach(function(a) {
+    var seq = (_fromSeq[a.fi] = (_fromSeq[a.fi] || 0));
+    a.fyOffset = (seq - (_fromCounts[a.fi] - 1) / 2) * 4;
+    _fromSeq[a.fi]++;
+  });
+  var arrows = arrowData.map(function(a) {
+    var fy = AXIS_H + a.fi * ROW_H + ROW_H / 2 + a.fyOffset;
+    var ty = AXIS_H + a.ti * ROW_H + ROW_H / 2;
+    var mx = (a.fx + a.txi) / 2;
+    return '<path id="garr-' + a.item.id + '" class="gantt-arrow" data-from="' + a.item.depends_on + '" data-to="' + a.item.id + '" data-blocked="' + (a.item._is_blocked ? '1' : '0') + '"'
+      + ' d="M' + a.fx + ',' + fy + ' C' + mx + ',' + fy + ' ' + mx + ',' + ty + ' ' + a.txi + ',' + ty + '"'
+      + ' fill="none" stroke="' + a.col + '" stroke-width="1.5" stroke-dasharray="' + a.dash + '" opacity="0.2"'
+      + ' marker-end="url(#arr-' + a.mid + ')"/>';
   }).join('');
 
   // Left HTML name panel (sticky, does not scroll with chart)
@@ -1983,9 +1999,10 @@ function renderGanttPage(rawData) {
   // SVG assembly
   var svg = '<svg id="gantt-svg" width="' + svgW + '" height="' + svgH + '" xmlns="http://www.w3.org/2000/svg" style="display:block">'
     + '<defs>'
-    + '<marker id="arr-gray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#4b5563"/></marker>'
-    + '<marker id="arr-red"  markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#ef4444"/></marker>'
-    + '<marker id="arr-cp"   markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#f59e0b"/></marker>'
+    + '<marker id="arr-gray"   markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#4b5563"/></marker>'
+    + '<marker id="arr-red"    markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#ef4444"/></marker>'
+    + '<marker id="arr-cp"     markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#f59e0b"/></marker>'
+    + '<marker id="arr-accent" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#818cf8"/></marker>'
     + '</defs>'
     + '<rect width="' + svgW + '" height="' + svgH + '" fill="#0f1117"/>'
     + '<line x1="0" y1="' + AXIS_H + '" x2="' + svgW + '" y2="' + AXIS_H + '" stroke="#1e2235" stroke-width="1"/>'
@@ -1996,12 +2013,12 @@ function renderGanttPage(rawData) {
   var legend = '<div id="gantt-legend-wrap" style="margin:6px 0 10px">'
     // Toggle button row
     + '<button id="gantt-legend-btn" onclick="(function(){'
-    +   'var b=document.getElementById(\'gantt-legend-body\');'
-    +   'var btn=document.getElementById(\'gantt-legend-btn\');'
-    +   'var open=b.style.display!==\'none\';'
-    +   'b.style.display=open?\'none\':\'flex\';'
-    +   'btn.setAttribute(\'aria-expanded\',open?\'false\':\'true\');'
-    +   'btn.querySelector(\'.gl-chevron\').style.transform=open?\'rotate(0deg)\':\'rotate(180deg)\';'
+    +   'var b=document.getElementById(\\'gantt-legend-body\\');'
+    +   'var btn=document.getElementById(\\'gantt-legend-btn\\');'
+    +   'var open=b.style.display!==\\'none\\';'
+    +   'b.style.display=open?\\'none\\':\\'flex\\';'
+    +   'btn.setAttribute(\\'aria-expanded\\',open?\\'false\\':\\'true\\');'
+    +   'btn.querySelector(\\'.gl-chevron\\').style.transform=open?\\'rotate(0deg)\\':\\'rotate(180deg)\\';'
     + '})()" aria-expanded="false" style="display:flex;align-items:center;gap:6px;background:transparent;border:none;cursor:pointer;padding:0;color:#64748b;font-size:12px">'
     + '<span style="font-weight:600;color:#94a3b8;font-size:12px">Legend</span>'
     + '<span class="gl-chevron" style="display:inline-block;transition:transform 0.2s;font-size:10px;line-height:1">&#9660;</span>'
@@ -2075,7 +2092,7 @@ function renderGanttPage(rawData) {
           el.setAttribute('stroke', onCp ? '#f59e0b' : (blocked ? '#ef4444' : '#4b5563'));
           el.setAttribute('marker-end', onCp ? 'url(#arr-cp)' : (blocked ? 'url(#arr-red)' : 'url(#arr-gray)'));
         } else {
-          el.setAttribute('opacity', '0.4');
+          el.setAttribute('opacity', '0.2');
           el.setAttribute('stroke-width', '1.5');
           el.setAttribute('stroke', blocked ? '#ef4444' : '#4b5563');
           el.setAttribute('marker-end', blocked ? 'url(#arr-red)' : 'url(#arr-gray)');
@@ -2105,8 +2122,13 @@ function renderGanttPage(rawData) {
         allArrows().forEach(function(el) {
           var from = el.getAttribute('data-from'), to = el.getAttribute('data-to');
           if (String(from) === rowId || String(to) === rowId) {
-            el.setAttribute('opacity', '1'); el.setAttribute('stroke-width', '2.5');
-          } else { el.setAttribute('opacity', '0.04'); }
+            el.setAttribute('opacity', '1');
+            el.setAttribute('stroke-width', '2.5');
+            el.setAttribute('stroke', '#818cf8');
+            el.setAttribute('marker-end', 'url(#arr-accent)');
+          } else {
+            el.setAttribute('opacity', '0.04');
+          }
         });
       });
       nameEl.addEventListener('mouseleave', function() {
