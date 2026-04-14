@@ -21,23 +21,57 @@ try {
   // ── PDCA v2 migration: chain columns + pdca_projects table ──────────────────
   (function runMigrations() {
     const cols = new Set(db.prepare('PRAGMA table_info(pdca_items)').all().map(c => c.name));
-    const chainCols = ['source_id','chain_root_id','iteration','chain_status','escalated_to','check_verdict','check_score','check_evidence','act_learnings'];
     const addCol = (col, type) => {
       if (!cols.has(col)) db.prepare(`ALTER TABLE pdca_items ADD COLUMN ${col} ${type}`).run();
     };
+    // Chain-tracking columns
+    const chainCols = ['source_id','chain_root_id','iteration','chain_status','escalated_to','check_verdict','check_score','check_evidence','act_learnings'];
     chainCols.forEach(col => addCol(col, 'TEXT'));
+    // Additional chain-tracking columns (v2 migration)
+    addCol('stuck_count', 'INTEGER NOT NULL DEFAULT 0');
+    addCol('notified_at', 'DATETIME');
+    addCol('project_dir', 'TEXT');
+    // Lean PDCA fields (v2 migration)
+    addCol('hypothesis', 'TEXT');
+    addCol('acceptance_criteria', 'TEXT');
+    addCol('check_gaps', 'TEXT');
+    // Indexes
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_pdca_chain_root  ON pdca_items(chain_root_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_pdca_source     ON pdca_items(source_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_pdca_status_phase ON pdca_items(status, phase)`);
+    // pdca_projects table — v2 schema
     const hasProjectsTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdca_projects'").get();
     if (!hasProjectsTable) {
       db.exec(`CREATE TABLE pdca_projects (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        name        TEXT NOT NULL UNIQUE,
-        description TEXT,
-        created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+        project_id      TEXT PRIMARY KEY,
+        project_dir     TEXT NOT NULL,
+        default_agent   TEXT,
+        max_iterations  INTEGER NOT NULL DEFAULT 3,
+        check_strategy  TEXT NOT NULL DEFAULT 'typecheck'
+                         CHECK(check_strategy IN ('typecheck','server-smoke','curl-endpoint','expo-start','manual')),
+        active          INTEGER NOT NULL DEFAULT 1
       )`);
-      const projects = db.prepare('SELECT DISTINCT project_id FROM pdca_items').all();
-      const insert = db.prepare('INSERT INTO pdca_projects (name) VALUES (?)');
-      projects.forEach(r => { try { insert.run(r.project_id); } catch (_) {} });
+      // Seed known projects
+      const insertProject = db.prepare(
+        'INSERT INTO pdca_projects (project_id, project_dir, default_agent, max_iterations, check_strategy, active) VALUES (?,?,?,?,?,?)'
+      );
+      const seedProjects = [
+        ['WorkBuddy', '/root/projects/workbuddy', 'workbuddy-agent', 3, 'expo-start',    1],
+        ['pdca-ui',   '/root/projects/pdca-ui',   'general-purpose', 3, 'server-smoke',  1],
+        ['ERP',       '/root/projects/ERP',        'erp-agent',       3, 'server-smoke',  1],
+        ['Konzult',   '/root/projects/sitegen',    'konzult-agent',   3, 'curl-endpoint', 1],
+        ['Pulse',     '/root/projects/pulse',      'pulse-agent',     3, 'typecheck',     1],
+      ];
+      seedProjects.forEach(row => { try { insertProject.run(...row); } catch (_) {} });
     }
+    // Backfill legacy rows with chain metadata
+    db.prepare(`UPDATE pdca_items SET chain_root_id = CAST(id AS TEXT) WHERE chain_root_id IS NULL OR chain_root_id = ''`).run();
+    db.prepare(`UPDATE pdca_items SET iteration = '1' WHERE iteration IS NULL OR iteration = ''`).run();
+    db.prepare(`UPDATE pdca_items SET chain_status = CASE
+      WHEN status = 'complete' THEN 'complete'
+      WHEN status IN ('cancelled','dropped') THEN 'abandoned'
+      ELSE 'active' END
+      WHERE chain_status IS NULL OR chain_status = ''`).run();
   })();
 } catch (err) {
   console.error('Failed to open database:', err.message);
@@ -1523,10 +1557,15 @@ function parseDbDate(v) {
   if (!v) return null;
   const raw = String(v).trim();
   if (!raw) return null;
+  // SQLite datetime format: '2025-04-14 10:30:00' (local time)
+  // Don't append 'Z' - treat as local time by using direct Date constructor
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(raw)) {
+    const d = new Date(raw.replace(' ', 'T'));
+    return isNaN(d.getTime()) ? null : d;
+  }
+  // ISO format with or without timezone
   const hasZone = /(?:Z|[+-]\d{2}:\d{2})$/.test(raw);
-  const iso = raw.includes('T')
-    ? raw + (hasZone ? '' : 'Z')
-    : raw.replace(' ', 'T') + (hasZone ? '' : 'Z');
+  const iso = hasZone ? raw : raw + 'Z';
   const d = new Date(iso);
   return isNaN(d.getTime()) ? null : d;
 }
