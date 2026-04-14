@@ -2305,7 +2305,7 @@ function redrawItems() {
       const estMins = item.estimated_mins ? fmtMins(item.estimated_mins) : null;
       const actMins = item.actual_mins ? fmtMins(item.actual_mins) : null;
       const canQueue = item.status === 'open';
-      return '<div class="item-card'+(hasDetail?' clickable':'')+'" '+(hasDetail?'onclick="toggleItemCard(\''+cid+'\')"':'')+' >'
+      return '<div class="item-card'+(hasDetail?' clickable':'')+'" '+(hasDetail?'onclick="toggleItemCard(\\\''+cid+'\\\')"':'')+' >'
         + '<div class="item-card-header">'
         + '<span class="item-card-dot">' + itemTrafficDot(item) + '</span>'
         + '<span class="item-card-title">'+esc(item.title)+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</span>'
