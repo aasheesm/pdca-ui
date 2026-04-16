@@ -6,10 +6,12 @@ const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
 
-const PORT = 7010;
+const PORT = Number(process.env.PORT) || 7010;
 const DB_PATH = '/root/data/assistant/tasks.db';
-const AUTH_USER = 'ashish@konzult.in';
-const AUTH_HASH = '$2b$14$N0/MVQbizO9uAx/6AP6dWO6EKsRTMixRdQjo/Kc/TMg2wXHwdyKXC';
+// Credentials: env-var with fallback to existing hash so a bad env doesn't lock anyone out.
+// Rotate via PDCA_AUTH_USER / PDCA_AUTH_HASH without editing source.
+const AUTH_USER = process.env.PDCA_AUTH_USER || 'ashish@konzult.in';
+const AUTH_HASH = process.env.PDCA_AUTH_HASH || '$2b$14$N0/MVQbizO9uAx/6AP6dWO6EKsRTMixRdQjo/Kc/TMg2wXHwdyKXC';
 
 let db;
 
@@ -57,10 +59,11 @@ try {
       );
       const seedProjects = [
         ['WorkBuddy', '/root/projects/workbuddy', 'workbuddy-agent', 3, 'expo-start',    1],
-        ['pdca-ui',   '/root/projects/pdca-ui',   'general-purpose', 3, 'server-smoke',  1],
+        ['pdca-ui',   '/root/projects/pdca',       'glm-agent',       3, 'server-smoke',  1],
         ['ERP',       '/root/projects/ERP',        'erp-agent',       3, 'server-smoke',  1],
         ['Konzult',   '/root/projects/sitegen',    'konzult-agent',   3, 'curl-endpoint', 1],
         ['Pulse',     '/root/projects/pulse',      'pulse-agent',     3, 'typecheck',     1],
+        ['Expresolv', '/root/projects/expresolv',  'glm-agent',       3, 'server-smoke',  1],
       ];
       seedProjects.forEach(row => { try { insertProject.run(...row); } catch (_) {} });
     }
@@ -86,12 +89,41 @@ const sessionDb = new (require('better-sqlite3'))('/root/data/assistant/pdca-ses
 app.use(cookieParser());
 app.set('trust proxy', 1);
 app.use(session({
+  name: 'pdca_sid',                                 // explicit, avoids collision with other apps on same domain
   secret: process.env.PDCA_SESSION_SECRET || 'pdca-dashboard-secret-2026',
   resave: false,
   saveUninitialized: false,
+  rolling: true,                                    // refresh expire on every authenticated request — keeps active users signed in
   store: new BetterSqliteStore({ client: sessionDb, expired: { clear: true, intervalMs: 900000 } }),
-  cookie: { maxAge: 7 * 24 * 60 * 60 * 1000, httpOnly: true, sameSite: 'lax' }
+  cookie: {
+    maxAge: 7 * 24 * 60 * 60 * 1000,                // 7d
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production',  // Caddy HTTPS → trust proxy → secure cookies in prod
+    path: '/',
+  }
 }));
+
+// Health check BEFORE auth middleware so monitors never flap during login outages
+app.get('/healthz', (_req, res) => {
+  try {
+    const row = db.prepare('SELECT 1 AS ok').get();
+    res.json({ ok: row.ok === 1, ts: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Per-request status logger — crashes/5xx/302 patterns visible in pm2 logs.
+// Placed before auth so redirects to /login also get logged with status.
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl} → ${res.statusCode} ${ms}ms`);
+  });
+  next();
+});
 
 function requireAuth(req, res, next) {
   if (req.session && req.session.authenticated) return next();
@@ -100,6 +132,8 @@ function requireAuth(req, res, next) {
   if (req.path.match(/\/api\/items\/\d+\/auto-queue-dependents$/) && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
   if (req.path === '/api/batch-unlock' && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not authenticated' });
+  // Clear the stale cookie on redirect so the browser doesn't keep sending a dead session id.
+  res.clearCookie('pdca_sid', { path: '/' });
   res.redirect('/login');
 }
 
@@ -216,12 +250,6 @@ app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
 });
 
 app.use(requireAuth);
-
-// Request logger
-app.use((req, res, next) => {
-  console.log(new Date().toISOString(), req.method, req.url);
-  next();
-});
 
 // ── Auth Routes ───────────────────────────────────────────────────────────────
 
@@ -1578,6 +1606,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .blocks-badge  { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:600; background:rgba(239,68,68,0.15); color:#f87171; vertical-align:middle; }
   .waiting-badge { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:4px; font-size:10px; font-weight:500; background:rgba(251,191,36,0.12); color:#fbbf24; vertical-align:middle; }
   .badge-open        { background: rgba(100,116,139,0.15); color: var(--muted); }
+  .badge-ready       { background: rgba(34,197,94,0.15); color: #22c55e; }
   .badge-blocked     { background: rgba(239,68,68,0.15); color: var(--red); }
   .badge-cancelled   { background: rgba(100,116,139,0.1); color: var(--muted); text-decoration: line-through; }
   .badge-pass    { background: rgba(34,197,94,0.15); color: var(--green); }
@@ -2015,7 +2044,7 @@ function priorityBadge(p) {
   return '<span class="badge ' + (m[p]||'badge-low') + '">' + esc(p||'—') + '</span>';
 }
 function statusBadge(s) {
-  const m = { complete:'badge-complete', 'in-progress':'badge-in-progress', queued:'badge-queued', open:'badge-open', blocked:'badge-blocked', cancelled:'badge-cancelled' };
+  const m = { complete:'badge-complete', 'in-progress':'badge-in-progress', queued:'badge-queued', open:'badge-open', blocked:'badge-blocked', cancelled:'badge-cancelled', locked:'badge-blocked', ready:'badge-ready' };
   return '<span class="badge ' + (m[s]||'badge-open') + '">' + esc(s||'—') + '</span>';
 }
 function outcomeBadge(o) {
@@ -2516,7 +2545,7 @@ function renderOverview(perf, items, cycles) {
 // PAGE: Items (merged — Pending / All / Blocked tabs)
 // ─────────────────────────────────────────────────────────────────────────────
 let itemsFilter = { search:'', priority:[], phase:[], status:[], agent:'' };
-let itemsTab = 'not-started'; // 'all' | 'pending' | 'complete' | 'blocked' | 'queued' | 'not-started' | 'dropped'
+let itemsTab = 'ready'; // 'all' | 'ready' | 'locked' | 'queued' | 'pending' | 'complete' | 'dropped'
 let itemsPage = 1;
 let itemsPageSize = 10;
 var ganttShowCritical = false;
@@ -2565,8 +2594,20 @@ function deriveBlocked(items) {
   return items.map(i => {
     const blocked = isAnyAncestorIncomplete(i) || i.status === 'blocked';
     const locked = isLocked(i);
+  // Build child map for blocks_count computation
+  const childCountMap = {};
+  items.forEach(i => {
+    if (i.depends_on) {
+      childCountMap[i.depends_on] = (childCountMap[i.depends_on] || 0) + 1;
+    }
+  });
+
+  return items.map(i => {
+    const blocked = isAnyAncestorIncomplete(i) || i.status === 'blocked';
+    const locked = isLocked(i);
     const ready = isReady(i);
-    return Object.assign({}, i, { _is_blocked: blocked, _is_locked: locked, _is_ready: ready });
+    const blocksCount = childCountMap[i.id] || 0;
+    return Object.assign({}, i, { _is_blocked: blocked, _is_locked: locked, _is_ready: ready, _blocks_count: blocksCount });
   });
 }
 
@@ -3029,14 +3070,14 @@ function renderItemsPage(rawData) {
     '<div class="tl-filter-bar">'
     + '<button class="tl-filter-btn'+(itemsTab==='all'?' tl-active':'')+'" data-tab="all" onclick="setItemsTab(&#39;all&#39;)" title="Show all items">'
     + '<span style="font-size:10px;display:inline-flex;vertical-align:middle">' + ICONS.grid + '</span> All<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='not-started'?' tl-active':'')+'" data-tab="not-started" onclick="setItemsTab(&#39;not-started&#39;)" title="Open — not started yet, no blocker">'
-    + '<span class="tl-dot tl-gray" style="font-size:10px">●</span> To Be Started<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='queued'?' tl-active':'')+'" data-tab="queued" onclick="setItemsTab(&#39;queued&#39;)" title="Blocked — queued behind a dependency">'
-    + '<span class="tl-dot tl-red" style="font-size:10px;opacity:.6">●</span> In Queue<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
+    + '<button class="tl-filter-btn'+(itemsTab==='ready'?' tl-active':'')+'" data-tab="ready" onclick="setItemsTab(&#39;ready&#39;)" title="Ready — all dependencies complete, can be started now">'
+    + '<span class="tl-dot tl-green" style="font-size:10px">●</span> Ready<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
+    + '<button class="tl-filter-btn'+(itemsTab==='locked'?' tl-active':'')+'" data-tab="locked" onclick="setItemsTab(&#39;locked&#39;)" title="Locked — incomplete dependency, cannot start yet">'
+    + '<span style="font-size:10px">🔒</span> Locked<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
+    + '<button class="tl-filter-btn'+(itemsTab==='queued'?' tl-active':'')+'" data-tab="queued" onclick="setItemsTab(&#39;queued&#39;)" title="Queued — dispatched, waiting for LLM pickup">'
+    + '<span class="tl-dot tl-purple" style="font-size:10px;opacity:.7">●</span> In Queue<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
     + '<button class="tl-filter-btn'+(itemsTab==='pending'?' tl-active':'')+'" data-tab="pending" onclick="setItemsTab(&#39;pending&#39;)" title="In progress (active work)">'
     + '<span class="tl-dot tl-amber" style="font-size:10px">●</span> In Progress<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='blocked'?' tl-active':'')+'" data-tab="blocked" onclick="setItemsTab(&#39;blocked&#39;)" title="Blocked — dependency not complete">'
-    + '<span class="tl-dot tl-red" style="font-size:10px">●</span> Blocked<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
     + '<button class="tl-filter-btn'+(itemsTab==='complete'?' tl-active':'')+'" data-tab="complete" onclick="setItemsTab(&#39;complete&#39;)" title="Completed items">'
     + '<span class="tl-dot tl-green" style="font-size:10px">●</span> Complete<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
     + '<button class="tl-filter-btn'+(itemsTab==='dropped'?' tl-active':'')+'" data-tab="dropped" onclick="setItemsTab(&#39;dropped&#39;)" title="Dropped / cancelled">'
@@ -3065,6 +3106,7 @@ function renderItemsPage(rawData) {
     + '<th data-col="priority">Priority</th>'
     + '<th data-col="phase">Phase</th>'
     + '<th data-col="status">Status</th>'
+    + '<th data-col="_blocks_count" title="How many items depend on this one — higher = more critical to start first">Blocks ↓</th>'
     + '<th data-col="category">Category</th>'
     + '<th data-col="agent_assigned">Agent</th>'
     + '<th data-col="estimated_mins">Est(m)</th>'
@@ -3079,6 +3121,10 @@ function renderItemsPage(rawData) {
 
   $('pageContent').innerHTML = html;
   applyDensity('tbl-items');
+  // Default sort: highest dependency (most downstream items) first
+  if (!sortState['items'] || !sortState['items'].col) {
+    sortState['items'] = { col: '_blocks_count', dir: 'desc' };
+  }
   attachSortHeaders('tbl-items', 'items', () => { itemsPage=1; redrawItems(); });
   redrawItems();
 }
@@ -3116,10 +3162,10 @@ function fmtMins(m) {
 function updateTabStats(data) {
   var tabDefs = {
     'all':         data,
-    'not-started': data.filter(function(i){ return i.status === 'open' && !i._is_blocked; }),
-    'queued':      data.filter(function(i){ return i.status === 'queued' || (i._is_blocked && i.status === 'open'); }),
+    'ready':       data.filter(function(i){ return i.status === 'open' && i._is_ready && !i._is_locked; }),
+    'locked':      data.filter(function(i){ return i._is_locked; }),
+    'queued':      data.filter(function(i){ return i.status === 'queued'; }),
     'pending':     data.filter(function(i){ return i.status === 'in-progress' && !i._is_blocked; }),
-    'blocked':     data.filter(function(i){ return i._is_blocked && i.status === 'in-progress'; }),
     'complete':    data.filter(function(i){ return i.status === 'complete'; }),
     'dropped':     data.filter(function(i){ return i.status === 'dropped' || i.status === 'cancelled'; }),
   };
@@ -3198,11 +3244,11 @@ function redrawItems() {
 
   // Traffic light tab filter
   let filtered = data.filter(i => {
+    if (itemsTab === 'ready')       return i.status === 'open' && i._is_ready && !i._is_locked;
+    if (itemsTab === 'locked')      return i._is_locked;
     if (itemsTab === 'pending')     return i.status === 'in-progress' && !i._is_blocked;
-    if (itemsTab === 'not-started') return i.status === 'open' && !i._is_blocked;
-    if (itemsTab === 'queued')      return i.status === 'queued' || (i._is_blocked && i.status === 'open');
+    if (itemsTab === 'queued')      return i.status === 'queued';
     if (itemsTab === 'complete')    return i.status === 'complete';
-    if (itemsTab === 'blocked')     return i._is_blocked && i.status === 'in-progress';
     if (itemsTab === 'dropped')     return i.status === 'dropped' || i.status === 'cancelled';
     return true; // 'all'
   });
@@ -3234,20 +3280,23 @@ function redrawItems() {
 
   const tbody = document.getElementById('items-tbody');
   if (!tbody) return;
-  const NCOLS = 13; // traffic dot + 11 data cols + trigger col
+  const NCOLS = 14; // traffic dot + 12 data cols + trigger col
   tbody.innerHTML = pageSlice.map(item => {
     const eid = 'ex-item-' + item.id;
     const hasDetail = item.plan_description || item.actual_description || item.remarks || item.errors_encountered || item.files_modified;
     const files = parseArr(item.files_modified);
     const canQueue = item.status === 'open';
-    const blocksCount = item.blocks_count || 0;
+    const bc = item._blocks_count || 0;
     const blockedByTitle = item.blocked_by_title || null;
-    const blockerTag = blocksCount > 0
-      ? ' <span class="blocks-badge" title="This item must complete before '+blocksCount+' other item'+(blocksCount>1?'s':'')+' can start">⬆ blocks '+blocksCount+'</span>'
+    const blockerTag = bc > 0
+      ? ' <span class="blocks-badge" title="This item must complete before '+bc+' other item'+(bc>1?'s':'')+' can start">⬆'+bc+'</span>'
       : '';
     const waitingTag = blockedByTitle
-      ? ' <span class="waiting-badge" title="Waiting for: '+esc(blockedByTitle)+'">' + ICONS.clock + ' waiting for #'+item.depends_on+'</span>'
+      ? ' <span class="waiting-badge" title="Waiting for: '+esc(blockedByTitle)+'">' + ICONS.clock + ' #'+item.depends_on+'</span>'
       : '';
+    const blocksCell = bc > 0
+      ? '<span style="color:#f59e0b;font-weight:600;font-size:12px">'+bc+'</span> <span style="font-size:10px;color:#64748b">downstream</span>'
+      : '<span style="color:#334155">—</span>';
     const triggerBtn = canQueue
       ? '<button class="row-trigger-btn" onclick="queueItem(event,'+item.id+')" title="Queue this item now">' + ICONS.play + '</button>'
       : item.status==='in-progress'
@@ -3259,7 +3308,8 @@ function redrawItems() {
       + '<td>'+esc(item.title)+blockerTag+waitingTag+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</td>'
       + '<td>'+priorityBadge(item.priority)+'</td>'
       + '<td>'+phaseBadge(item.phase)+'</td>'
-      + '<td>'+statusBadge(item._is_blocked ? 'blocked' : item.status)+'</td>'
+      + '<td>'+statusBadge(item._is_locked ? 'locked' : item._is_ready ? 'ready' : item._is_blocked ? 'blocked' : item.status)+'</td>'
+      + '<td>'+blocksCell+'</td>'
       + '<td class="dim">'+fmt(item.category)+'</td>'
       + '<td class="dim">'+fmt(item.agent_assigned)+'</td>'
       + '<td class="dim">'+fmt(item.estimated_mins)+'</td>'
@@ -4310,8 +4360,7 @@ app.get('*', (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-// Bind to localhost — pdca.konzult.in via Caddy is the only public ingress.
-// Override with LISTEN_HOST=0.0.0.0 only if you deliberately need direct access.
+// Bind to localhost — Caddy (pdca.konzult.in) is the only public ingress.
 const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
 app.listen(PORT, LISTEN_HOST, () => {
   console.log(`PDCA Dashboard running at http://${LISTEN_HOST}:${PORT}`);
