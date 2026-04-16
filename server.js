@@ -169,7 +169,7 @@ app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
 
     if (existing) {
       // Update existing item with new occurrence info
-      db.prepare("UPDATE pdca_items SET actual_description = ?, updated_at = datetime('now','localtime') WHERE id = ?")
+      db.prepare("UPDATE pdca_items SET actual_description = ? WHERE id = ?")
         .run(actualDesc, existing.id);
       db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))")
         .run(existing.id, '[GlitchTip] Recurring error: +1 occurrence | Total: ' + eventCount + ' | Users: ' + userCount);
@@ -457,15 +457,108 @@ app.get('/api/chains', (req, res) => {
   }
 });
 
+// ── Dependency Chain Helpers ───────────────────────────────────────────────────
+// Walk the depends_on ancestry chain recursively
+function getAncestorChain(itemById, startId) {
+  const visited = new Set();
+  const chain = [];
+  let current = startId;
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const item = itemById[current];
+    if (!item) break;
+    chain.push(item);
+    current = item.depends_on;
+  }
+  return chain; // [startItem, parentItem, grandparentItem, ...]
+}
+
+// Walk all descendants (items that depend_on this item, recursively)
+function getDescendantChain(items, startId) {
+  const childMap = {};
+  items.forEach(i => {
+    if (i.depends_on) {
+      if (!childMap[i.depends_on]) childMap[i.depends_on] = [];
+      childMap[i.depends_on].push(i);
+    }
+  });
+  const visited = new Set();
+  const chain = [];
+  const stack = [startId];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const children = childMap[id] || [];
+    children.forEach(c => {
+      chain.push(c);
+      stack.push(c.id);
+    });
+  }
+  return chain; // [childItem, grandchildItem, ...]
+}
+
+// ── Get full dependency chain for an item ─────────────────────────────────────
+app.get('/api/items/:id/dependency-chain', (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const item = db.prepare('SELECT * FROM pdca_items WHERE id = ?').get(id);
+    if (!item) return res.status(404).json({ error: 'Item not found' });
+
+    // Fetch all items in same project for chain resolution
+    const projectItems = db.prepare('SELECT * FROM pdca_items WHERE project_id = ?').all(item.project_id);
+    const itemById = {};
+    projectItems.forEach(i => { itemById[i.id] = i; });
+
+    const ancestors = getAncestorChain(itemById, id);
+    const descendants = getDescendantChain(projectItems, id);
+
+    // Check if all ancestors are complete → determines "ready" state
+    const incompleteAncestors = ancestors.filter(a => a.id !== id && a.status !== 'complete' && a.status !== 'cancelled' && a.status !== 'dropped');
+
+    res.json({
+      item: { id: item.id, title: item.title, status: item.status, phase: item.phase, depends_on: item.depends_on },
+      ancestors: ancestors.filter(a => a.id !== id).map(a => ({ id: a.id, title: a.title, status: a.status, phase: a.phase, depends_on: a.depends_on })),
+      descendants: descendants.map(d => ({ id: d.id, title: d.title, status: d.status, phase: d.phase, depends_on: d.depends_on })),
+      ready: incompleteAncestors.length === 0,
+      blocked_by: incompleteAncestors.map(a => ({ id: a.id, title: a.title, status: a.status }))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Queue a single item (open → queued). Zero LLM calls — just state change + kick processor.
+// ENFORCED: No item can be queued if any transitive dependency (ancestor) is not complete.
 app.post('/api/items/:id/queue', (req, res) => {
   try {
     const id = parseInt(req.params.id);
-    const row = db.prepare('SELECT id, status, agent_assigned FROM pdca_items WHERE id = ?').get(id);
+    const row = db.prepare('SELECT id, status, agent_assigned, depends_on, project_id FROM pdca_items WHERE id = ?').get(id);
     if (!row) return res.status(404).json({ error: 'Item not found' });
     if (!['open'].includes(row.status)) {
       return res.json({ ok: false, message: `Item is already ${row.status} — cannot queue` });
     }
+
+    // ── Hierarchical dependency gate ────────────────────────────────────────
+    // Walk the entire depends_on chain and verify ALL ancestors are complete
+    if (row.depends_on) {
+      const projectItems = db.prepare('SELECT id, title, status, depends_on FROM pdca_items WHERE project_id = ?').all(row.project_id);
+      const itemById = {};
+      projectItems.forEach(i => { itemById[i.id] = i; });
+
+      const ancestors = getAncestorChain(itemById, id);
+      const incompleteAncestors = ancestors.filter(a => a.id !== id && a.status !== 'complete' && a.status !== 'cancelled' && a.status !== 'dropped');
+
+      if (incompleteAncestors.length > 0) {
+        const blockers = incompleteAncestors.map(a => `#${a.id} ${a.title} (${a.status})`);
+        return res.json({
+          ok: false,
+          message: `Cannot queue: ${incompleteAncestors.length} incomplete ancestor(s). All dependencies must be complete before queueing.`,
+          blocked_by: incompleteAncestors.map(a => ({ id: a.id, title: a.title, status: a.status }))
+        });
+      }
+    }
+
     db.prepare("UPDATE pdca_items SET status='queued', started_at=datetime('now', 'localtime') WHERE id=?").run(id);
 
     // Kick the queue processor in the background (non-blocking)
@@ -1955,12 +2048,12 @@ async function loadProjects() {
       opt.value = opt.textContent = p;
       sel.appendChild(opt);
     });
-    // Restore saved project from last session, then fall back to auto-select for single project
+    // Restore saved project from last session, or fall back to first project
     const saved = localStorage.getItem('pdca-project');
     if (saved && projects.includes(saved)) {
       sel.value = saved;
       onProjectChange();
-    } else if (projects.length === 1) {
+    } else if (projects.length >= 1) {
       sel.value = projects[0];
       onProjectChange();
     }
@@ -2129,7 +2222,7 @@ function makeColToggleDropdown(tableId, cols, onToggle) {
     '<label><input type="checkbox" data-col="' + c.key + '" ' + (vis[c.key] ? 'checked' : '') + '> ' + esc(c.label) + '</label>'
   ).join('');
   const html = '<div style="position:relative;display:inline-block">'
-    + '<button class="col-toggle-btn" onclick="this.nextSibling.classList.toggle(\\'open\\')">Columns ' + ICONS.chevronDown + '</button>'
+    + '<button class="col-toggle-btn" onclick="this.nextSibling.classList.toggle(&#39;open&#39;)">Columns ' + ICONS.chevronDown + '</button>'
     + '<div class="col-dropdown" id="coldrop-' + tableId + '">' + items + '</div>'
     + '</div>';
   return html;
@@ -2158,7 +2251,7 @@ const densityState = {};
 function makeDensityBtn(tableId) {
   const d = densityState[tableId] || localStorage.getItem('density-' + tableId) || 'normal';
   densityState[tableId] = d;
-  return '<button class="density-btn" id="densitybtn-' + tableId + '" onclick="cycleDensity(\\'' + tableId + '\\')">'
+  return '<button class="density-btn" id="densitybtn-' + tableId + '" onclick="cycleDensity(&#39;' + tableId + '&#39;)">'
     + (d === 'compact' ? 'Compact' : d === 'comfortable' ? 'Comfortable' : 'Normal') + '</button>';
 }
 
@@ -2267,10 +2360,10 @@ function renderOverview(perf, items, cycles) {
     '<div class="section"><div class="section-header"><div class="section-title"><span style="display:inline-flex;vertical-align:middle;margin-right:6px">' + ICONS.overview14 + '</span>Project Performance</div></div>'
     + '<div class="perf-projects">' + (perfCards || '<div class="no-data">No performance data.</div>') + '</div></div>'
     + '<div class="section"><div class="section-header"><div class="section-title"><span style="display:inline-flex;vertical-align:middle;margin-right:6px">' + ICONS.checkCircle14 + '</span>Done This Week <span class="count">' + doneItems.length + '</span></div>'
-    + '<a class="view-all" onclick="navigateTo(\\'items\\')">View all →</a></div>'
+    + '<a class="view-all" onclick="navigateTo(&#39;items&#39;)">View all →</a></div>'
     + '<div class="table-wrap">' + doneHtml + '</div></div>'
     + '<div class="section"><div class="section-header"><div class="section-title"><span style="display:inline-flex;vertical-align:middle;margin-right:6px">' + ICONS.cycles14 + '</span>Activity Feed <span class="count">' + feedCycles.length + '</span></div>'
-    + '<a class="view-all" onclick="navigateTo(\\'cycles\\')">View all →</a></div>'
+    + '<a class="view-all" onclick="navigateTo(&#39;cycles&#39;)">View all →</a></div>'
     + '<div class="table-wrap">' + feedHtml + '</div></div>';
 }
 
@@ -2287,11 +2380,38 @@ var ganttZoom = 'week'; // day | week | month
 // Derive is_blocked: item has depends_on set AND the parent's status is not 'complete'
 function deriveBlocked(items) {
   const statusById = {};
-  items.forEach(i => { statusById[i.id] = i.status; });
+  const itemById = {};
+  items.forEach(i => {
+    statusById[i.id] = i.status;
+    itemById[i.id] = i;
+  });
+
+  // Check transitive dependency: walk up the depends_on chain
+  // An item is blocked if ANY ancestor in its chain is not complete/cancelled/dropped
+  function isAnyAncestorIncomplete(item) {
+    const visited = new Set();
+    let current = item.depends_on;
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const ancestor = itemById[current];
+      if (!ancestor) break; // dependency not in this project — assume not blocking
+      if (ancestor.status !== 'complete' && ancestor.status !== 'cancelled' && ancestor.status !== 'dropped') {
+        return true; // ancestor is incomplete → blocked
+      }
+      current = ancestor.depends_on;
+    }
+    return false;
+  }
+
+  // Check if an item is "ready" (all ancestors complete)
+  function isReady(item) {
+    return !isAnyAncestorIncomplete(item);
+  }
+
   return items.map(i => {
-    const blocked = !!(i.depends_on && statusById[i.depends_on] && statusById[i.depends_on] !== 'complete')
-      || i.status === 'blocked';
-    return Object.assign({}, i, { _is_blocked: blocked });
+    const blocked = isAnyAncestorIncomplete(i) || i.status === 'blocked';
+    const ready = !blocked && i.status === 'open';
+    return Object.assign({}, i, { _is_blocked: blocked, _is_ready: ready });
   });
 }
 
@@ -2300,6 +2420,7 @@ function itemTrafficDot(item) {
   if (item.status === 'complete') return '<span class="tl-dot tl-green" title="Complete">●</span>';
   if (item.status === 'queued') return '<span class="tl-dot tl-purple" title="Queued — dispatched, waiting for LLM pickup">●</span>';
   if (item.status === 'in-progress' || item.phase === 'check') return '<span class="tl-dot tl-amber" title="In progress">●</span>';
+  if (item._is_ready) return '<span class="tl-dot tl-green" title="Ready — all dependencies complete, can be started now">●</span>';
   if (item.status === 'dropped' || item.status === 'cancelled') return '<span class="tl-dot tl-gray" title="Dropped / cancelled">●</span>';
   return '<span class="tl-dot tl-gray" title="Open — not started">●</span>';
 }
@@ -2521,12 +2642,12 @@ function renderGanttPage(rawData) {
   var legend = '<div id="gantt-legend-wrap" style="margin:6px 0 10px">'
     // Toggle button row
     + '<button id="gantt-legend-btn" onclick="(function(){'
-    +   'var b=document.getElementById(\\'gantt-legend-body\\');'
-    +   'var btn=document.getElementById(\\'gantt-legend-btn\\');'
-    +   'var open=b.style.display!==\\'none\\';'
-    +   'b.style.display=open?\\'none\\':\\'flex\\';'
-    +   'btn.setAttribute(\\'aria-expanded\\',open?\\'false\\':\\'true\\');'
-    +   'btn.querySelector(\\'.gl-chevron\\').style.transform=open?\\'rotate(0deg)\\':\\'rotate(180deg)\\';'
+    +   'var b=document.getElementById(&#39;gantt-legend-body&#39;);'
+    +   'var btn=document.getElementById(&#39;gantt-legend-btn&#39;);'
+    +   'var open=b.style.display!==&#39;none&#39;;'
+    +   'b.style.display=open?&#39;none&#39;:&#39;flex&#39;;'
+    +   'btn.setAttribute(&#39;aria-expanded&#39;,open?&#39;false&#39;:&#39;true&#39;);'
+    +   'btn.querySelector(&#39;.gl-chevron&#39;).style.transform=open?&#39;rotate(0deg)&#39;:&#39;rotate(180deg)&#39;;'
     + '})()" aria-expanded="false" style="display:flex;align-items:center;gap:6px;background:transparent;border:none;cursor:pointer;padding:0;color:#64748b;font-size:12px">'
     + '<span style="font-weight:600;color:#94a3b8;font-size:12px">Legend</span>'
     + '<span class="gl-chevron" style="display:inline-block;transition:transform 0.2s;font-size:10px;line-height:1">&#9660;</span>'
@@ -2571,9 +2692,9 @@ function renderGanttPage(rawData) {
   var toolbar = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap">'
     + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Gantt &mdash; Dependency View</h2>'
     + '<div style="display:flex;gap:4px;background:#1a1d27;border:1px solid #2d3148;border-radius:20px;padding:3px">'
-    + '<button onclick="setGanttZoom(\'day\')" style="' + zoomBtnStyle('day') + '">Day</button>'
-    + '<button onclick="setGanttZoom(\'week\')" style="' + zoomBtnStyle('week') + '">Week</button>'
-    + '<button onclick="setGanttZoom(\'month\')" style="' + zoomBtnStyle('month') + '">Month</button>'
+    + '<button onclick="setGanttZoom(&quot;day&quot;)" style="' + zoomBtnStyle('day') + '">Day</button>'
+    + '<button onclick="setGanttZoom(&quot;week&quot;)" style="' + zoomBtnStyle('week') + '">Week</button>'
+    + '<button onclick="setGanttZoom(&quot;month&quot;)" style="' + zoomBtnStyle('month') + '">Month</button>'
     + '</div>'
     + '<button id="gantt-cp-btn" style="font-size:12px;padding:5px 16px;border-radius:16px;border:1px solid #f59e0b;background:transparent;color:#f59e0b;cursor:pointer">Critical Path</button>'
     + '</div>'
@@ -2750,28 +2871,28 @@ function renderItemsPage(rawData) {
 
   const html =
     '<div class="tl-filter-bar">'
-    + '<button class="tl-filter-btn'+(itemsTab==='all'?' tl-active':'')+'" data-tab="all" onclick="setItemsTab(\\'all\\')" title="Show all items">'
+    + '<button class="tl-filter-btn'+(itemsTab==='all'?' tl-active':'')+'" data-tab="all" onclick="setItemsTab(&#39;all&#39;)" title="Show all items">'
     + '<span style="font-size:10px;display:inline-flex;vertical-align:middle">' + ICONS.grid + '</span> All<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='not-started'?' tl-active':'')+'" data-tab="not-started" onclick="setItemsTab(\\'not-started\\')" title="Open — not started yet, no blocker">'
+    + '<button class="tl-filter-btn'+(itemsTab==='not-started'?' tl-active':'')+'" data-tab="not-started" onclick="setItemsTab(&#39;not-started&#39;)" title="Open — not started yet, no blocker">'
     + '<span class="tl-dot tl-gray" style="font-size:10px">●</span> To Be Started<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='queued'?' tl-active':'')+'" data-tab="queued" onclick="setItemsTab(\\'queued\\')" title="Blocked — queued behind a dependency">'
+    + '<button class="tl-filter-btn'+(itemsTab==='queued'?' tl-active':'')+'" data-tab="queued" onclick="setItemsTab(&#39;queued&#39;)" title="Blocked — queued behind a dependency">'
     + '<span class="tl-dot tl-red" style="font-size:10px;opacity:.6">●</span> In Queue<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='pending'?' tl-active':'')+'" data-tab="pending" onclick="setItemsTab(\\'pending\\')" title="In progress (active work)">'
+    + '<button class="tl-filter-btn'+(itemsTab==='pending'?' tl-active':'')+'" data-tab="pending" onclick="setItemsTab(&#39;pending&#39;)" title="In progress (active work)">'
     + '<span class="tl-dot tl-amber" style="font-size:10px">●</span> In Progress<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='blocked'?' tl-active':'')+'" data-tab="blocked" onclick="setItemsTab(\\'blocked\\')" title="Blocked — dependency not complete">'
+    + '<button class="tl-filter-btn'+(itemsTab==='blocked'?' tl-active':'')+'" data-tab="blocked" onclick="setItemsTab(&#39;blocked&#39;)" title="Blocked — dependency not complete">'
     + '<span class="tl-dot tl-red" style="font-size:10px">●</span> Blocked<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='complete'?' tl-active':'')+'" data-tab="complete" onclick="setItemsTab(\\'complete\\')" title="Completed items">'
+    + '<button class="tl-filter-btn'+(itemsTab==='complete'?' tl-active':'')+'" data-tab="complete" onclick="setItemsTab(&#39;complete&#39;)" title="Completed items">'
     + '<span class="tl-dot tl-green" style="font-size:10px">●</span> Complete<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
-    + '<button class="tl-filter-btn'+(itemsTab==='dropped'?' tl-active':'')+'" data-tab="dropped" onclick="setItemsTab(\\'dropped\\')" title="Dropped / cancelled">'
+    + '<button class="tl-filter-btn'+(itemsTab==='dropped'?' tl-active':'')+'" data-tab="dropped" onclick="setItemsTab(&#39;dropped&#39;)" title="Dropped / cancelled">'
     + '<span class="tl-dot tl-gray" style="font-size:10px;opacity:.4">●</span> Dropped<span class="tl-meta"><span class="tl-cnt">—</span><span class="tl-time-lbl"></span></span></button>'
     + '</div>'
     + '<div class="filter-bar" id="items-filters">'
     + '<div class="filter-group"><label>Search</label><input type="text" id="items-search" placeholder="Title or plan…" value="'+esc(itemsFilter.search)+'" oninput="itemsFilter.search=this.value;itemsPage=1;redrawItems()"></div>'
     + '<div class="filter-group"><label>Priority</label><div class="check-group">'
-    + ['critical','high','medium','low'].map(p=>'<label class="check-pill'+(itemsFilter.priority.includes(p)?' checked':'')+'"><input type="checkbox" '+(itemsFilter.priority.includes(p)?'checked':'')+' onchange="toggleFilter(itemsFilter.priority,\\''+p+'\\',this.checked);this.parentElement.classList.toggle(\\'checked\\',this.checked);itemsPage=1;redrawItems()"> '+p+'</label>').join('')
+    + ['critical','high','medium','low'].map(p=>'<label class="check-pill'+(itemsFilter.priority.includes(p)?' checked':'')+'"><input type="checkbox" '+(itemsFilter.priority.includes(p)?'checked':'')+' onchange="toggleFilter(itemsFilter.priority,&#39;'+p+'&#39;,this.checked);this.parentElement.classList.toggle(&#39;checked&#39;,this.checked);itemsPage=1;redrawItems()"> '+p+'</label>').join('')
     + '</div></div>'
     + '<div class="filter-group"><label>Phase</label><div class="check-group">'
-    + ['plan','do','check','act'].map(p=>'<label class="check-pill'+(itemsFilter.phase.includes(p)?' checked':'')+'"><input type="checkbox" '+(itemsFilter.phase.includes(p)?'checked':'')+' onchange="toggleFilter(itemsFilter.phase,\\''+p+'\\',this.checked);this.parentElement.classList.toggle(\\'checked\\',this.checked);itemsPage=1;redrawItems()"> '+p+'</label>').join('')
+    + ['plan','do','check','act'].map(p=>'<label class="check-pill'+(itemsFilter.phase.includes(p)?' checked':'')+'"><input type="checkbox" '+(itemsFilter.phase.includes(p)?'checked':'')+' onchange="toggleFilter(itemsFilter.phase,&#39;'+p+'&#39;,this.checked);this.parentElement.classList.toggle(&#39;checked&#39;,this.checked);itemsPage=1;redrawItems()"> '+p+'</label>').join('')
     + '</div></div>'
     + '<div class="filter-group"><label>Agent</label><select onchange="itemsFilter.agent=this.value;itemsPage=1;redrawItems()">' + agentOpts + '</select></div>'
     + '<button class="clear-btn" onclick="clearItemsFilters()">Clear</button>'
@@ -2863,6 +2984,19 @@ function updateTabStats(data) {
   });
 }
 
+function depGoto(id) {
+  setItemsTab('all');
+  setTimeout(function() {
+    var r = document.querySelector('tr[data-expand="ex-item-' + id + '"]');
+    if (r) r.click();
+  }, 200);
+}
+
+function closeFlowDetail() {
+  var p = document.getElementById('flow-detail');
+  if (p) p.style.display = 'none';
+}
+
 function buildDepInspector(item, allItems) {
   // Find what this item depends on (blockers)
   var blockerHtml = '';
@@ -2871,7 +3005,7 @@ function buildDepInspector(item, allItems) {
     blockerHtml = '<div style="margin-bottom:6px">'
       + '<span style="font-size:11px;color:#64748b">Blocked by:</span> '
       + (blocker
-        ? '<a href="#" onclick="event.preventDefault();setItemsTab(\'all\');setTimeout(function(){var r=document.querySelector(\'tr[data-expand=\\\'ex-item-'+blocker.id+'\\\'\')\');if(r)r.click()},200)" style="color:#60a5fa;text-decoration:none;font-size:12px">'
+        ? '<a href="#" onclick="event.preventDefault();depGoto(' + blocker.id + ')" style="color:#60a5fa;text-decoration:none;font-size:12px">'
           + '<span class="badge badge-num">#'+blocker.id+'</span> '+esc(blocker.title)+'</a>'
           + ' <span class="badge '+(blocker.status==='complete'?'badge-complete':blocker.status==='in-progress'?'badge-in-progress':'badge-open')+'">'+esc(blocker.status)+'</span>'
         : '<span style="color:#64748b;font-size:12px">#'+item.depends_on+' (not loaded)</span>')
@@ -2884,7 +3018,7 @@ function buildDepInspector(item, allItems) {
     dependentsHtml = '<div>'
       + '<span style="font-size:11px;color:#64748b">Blocks ' + dependents.length + ' item' + (dependents.length>1?'s':'') + ':</span> '
       + dependents.map(function(d) {
-          return '<a href="#" onclick="event.preventDefault();setItemsTab(\'all\');setTimeout(function(){var r=document.querySelector(\'tr[data-expand=\\\'ex-item-'+d.id+'\\\'\')\');if(r)r.click()},200)" style="color:#60a5fa;text-decoration:none;font-size:12px">'
+          return '<a href="#" onclick="event.preventDefault();depGoto(' + d.id + ')" style="color:#60a5fa;text-decoration:none;font-size:12px">'
             + '<span class="badge badge-num">#'+d.id+'</span> '+esc(d.title)+'</a>'
             + ' <span class="badge '+(d.status==='complete'?'badge-complete':d._is_blocked?'badge-blocked':d.status==='in-progress'?'badge-in-progress':'badge-open')+'">'+esc(d.status)+'</span>';
         }).join('  ')
@@ -2961,7 +3095,7 @@ function redrawItems() {
     const triggerBtn = canQueue
       ? '<button class="row-trigger-btn" onclick="queueItem(event,'+item.id+')" title="Queue this item now">' + ICONS.play + '</button>'
       : item.status==='in-progress'
-        ? '<button class="log-btn" style="padding:2px 8px;font-size:11px" onclick="event.stopPropagation();openLogModal('+item.id+',\\''+esc(item.title).replace(/\\'/g,'').slice(0,40)+'\\')" title="View live logs">Logs</button>'
+        ? '<button class="log-btn" style="padding:2px 8px;font-size:11px" onclick="event.stopPropagation();openLogModal('+item.id+',&#39;'+esc(item.title).replace(/'/g,'').slice(0,40)+'&#39;)" title="View live logs">Logs</button>'
       : '<span style="color:var(--muted);font-size:11px;display:inline-flex;vertical-align:middle">'+(item.status==='queued'?ICONS.clock:item.status==='complete'?ICONS.checkSmall:'—')+'</span>';
     return '<tr class="'+(hasDetail?'clickable-row':'')+'" '+(hasDetail?'data-expand="'+eid+'"':'')+' title="'+(hasDetail?'Click to expand':'')+'">'
       + '<td style="text-align:center;padding:10px 6px">' + itemTrafficDot(item) + '</td>'
@@ -3001,7 +3135,7 @@ function redrawItems() {
       const estMins = item.estimated_mins ? fmtMins(item.estimated_mins) : null;
       const actMins = item.actual_mins ? fmtMins(item.actual_mins) : null;
       const canQueue = item.status === 'open';
-      return '<div class="item-card'+(hasDetail?' clickable':'')+'" '+(hasDetail?'onclick="toggleItemCard(\\\''+cid+'\\\')"':'')+' >'
+      return '<div class="item-card'+(hasDetail?' clickable':'')+'" '+(hasDetail?'onclick="toggleItemCard(&#39;'+cid+'&#39;)"':'')+' >'
         + '<div class="item-card-header">'
         + '<span class="item-card-dot">' + itemTrafficDot(item) + '</span>'
         + '<span class="item-card-title">'+esc(item.title)+(hasDetail?' <span style="color:var(--muted);font-size:10px">▼</span>':'')+'</span>'
@@ -3153,12 +3287,13 @@ function renderFlowPage(rawData) {
   if (svgW < 400) svgW = 400;
   if (svgH < 300) svgH = 300;
 
-  // Colour helpers
+  // Colour helpers — now includes "ready" state (all ancestors complete, can be worked on)
   function nodeStroke(item) {
     if (item._is_blocked) return '#ef4444';
     if (item.status === 'complete') return '#22c55e';
     if (item.status === 'in-progress') return '#eab308';
     if (item.status === 'dropped' || item.status === 'cancelled') return '#4b5563';
+    if (item._is_ready) return '#22c55e'; // ready = all deps complete, can start now
     return '#3b82f6';
   }
   function nodeFill(item) {
@@ -3166,7 +3301,13 @@ function renderFlowPage(rawData) {
     if (item.status === 'complete') return 'rgba(34,197,94,0.12)';
     if (item.status === 'in-progress') return 'rgba(234,179,8,0.12)';
     if (item.status === 'dropped' || item.status === 'cancelled') return 'rgba(75,85,99,0.12)';
+    if (item._is_ready) return 'rgba(34,197,94,0.08)'; // subtle green tint for ready
     return 'rgba(30,34,51,0.9)';
+  }
+  // Ready indicator — small green dot to show "ready to start"
+  function nodeReadyIndicator(item) {
+    if (item._is_ready) return '<circle cx="' + (NODE_W - 8) + '" cy="8" r="4" fill="#22c55e" opacity="0.9"/><title>Ready — all dependencies complete</title>';
+    return '';
   }
 
   // Draw edges (dependency arrows)
@@ -3189,7 +3330,7 @@ function renderFlowPage(rawData) {
       + ' marker-end="url(#flow-arr-' + (item._is_blocked?'red':'gray') + ')"/>';
   }).join('');
 
-  // Draw nodes
+  // Draw nodes — with ready indicator (green dot) and hierarchical status
   var nodes = data.map(function(item) {
     var pos = positions[item.id];
     if (!pos) return '';
@@ -3198,14 +3339,16 @@ function renderFlowPage(rawData) {
     var titleText = item.title.length > 18 ? item.title.slice(0,18) + '…' : item.title;
     var statusText = item.status;
     if (item._is_blocked) statusText = 'blocked';
+    else if (item._is_ready) statusText = 'ready';
     return '<g class="flow-node" data-id="' + item.id + '" data-status="' + esc(item.status) + '" data-title="' + esc(item.title) + '"'
       + ' style="cursor:pointer" transform="translate(' + pos.x + ',' + pos.y + ')">'
       + '<rect x="0" y="0" width="' + NODE_W + '" height="' + NODE_H + '" rx="' + NODE_RX + '"'
       + ' fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5" class="flow-node-rect"/>'
+      + nodeReadyIndicator(item)
       + '<text x="' + (NODE_W/2) + '" y="18" font-size="11" fill="#e2e8f0" text-anchor="middle" font-family="sans-serif" font-weight="600">#' + item.id + '</text>'
       + '<text x="' + (NODE_W/2) + '" y="32" font-size="10" fill="#94a3b8" text-anchor="middle" font-family="sans-serif">' + esc(titleText) + '</text>'
       + '<text x="' + (NODE_W/2) + '" y="46" font-size="9" fill="' + stroke + '" text-anchor="middle" font-family="monospace">' + esc(statusText) + '</text>'
-      + '<title>' + esc(item.title) + ' | ' + esc(item.status) + (item.priority?' | '+item.priority:'') + '</title>'
+      + '<title>' + esc(item.title) + ' | ' + esc(item.status) + (item.priority?' | '+item.priority:'') + (item._is_ready?' | READY':'') + '</title>'
       + '</g>';
   }).join('');
 
@@ -3228,10 +3371,10 @@ function renderFlowPage(rawData) {
     + '</svg>';
 
   // Detail panel HTML (shows on click)
-  var detailPanel = '<div id="flow-detail" style="display:none;position:fixed;right:24px;top:80px;width:300px;background:#1a1d27;border:1px solid #334155;border-radius:10px;padding:16px;z-index:500;box-shadow:0 8px 32px rgba(0,0,0,0.7)">'
+  var detailPanel = '<div id="flow-detail" style="display:none;position:fixed;right:24px;top:80px;width:380px;max-height:80vh;overflow-y:auto;background:#1a1d27;border:1px solid #334155;border-radius:10px;padding:16px;z-index:500;box-shadow:0 8px 32px rgba(0,0,0,0.7)">'
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
     + '<span style="font-size:14px;font-weight:700;color:#e2e8f0;flex:1" id="flow-detail-title">—</span>'
-    + '<button onclick="document.getElementById(\'flow-detail\').style.display=\'none\'" style="background:transparent;border:none;color:#64748b;cursor:pointer;font-size:16px;padding:0 4px">x</button>'
+    + '<button onclick="closeFlowDetail()" style="background:transparent;border:none;color:#64748b;cursor:pointer;font-size:16px;padding:0 4px">x</button>'
     + '</div>'
     + '<div id="flow-detail-body" style="font-size:13px;color:#94a3b8;line-height:1.6"></div>'
     + '</div>';
@@ -3239,7 +3382,7 @@ function renderFlowPage(rawData) {
   $('pageContent').innerHTML =
     '<div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">'
     + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Flow &mdash; Dependency DAG</h2>'
-    + '<span style="font-size:13px;color:#64748b">' + data.length + ' nodes &middot; Layered by dependency depth &middot; Click a node to inspect</span>'
+    + '<span style="font-size:13px;color:#64748b">' + data.length + ' nodes &middot; Layered by dependency depth &middot; Hover to trace chain &middot; Click for full dependency detail</span>'
     + '</div>'
     + '<div style="background:#1a1d27;border:1px solid #1e2235;border-radius:8px;overflow-x:auto;padding:8px">'
     + svg + '</div>'
@@ -3265,14 +3408,32 @@ function renderFlowPage(rawData) {
       });
     }
 
-    // Hover highlight
+    // Hover highlight — trace full ancestor + descendant chain
     allNodes().forEach(function(g) {
       var nodeId = g.getAttribute('data-id');
       g.addEventListener('mouseenter', function() {
+        // Build ancestor and descendant chain IDs for this node
+        var chainIds = {};
+        chainIds[nodeId] = true;
+        // Walk ancestors
+        var cur = (cache.items||[]).find(function(i) { return String(i.id) === nodeId; });
+        while (cur && cur.depends_on) {
+          chainIds[cur.depends_on] = true;
+          cur = (cache.items||[]).find(function(i) { return i.id === cur.depends_on; });
+        }
+        // Walk descendants
+        var childMap = {};
+        (cache.items||[]).forEach(function(i) { if (i.depends_on) { if (!childMap[i.depends_on]) childMap[i.depends_on] = []; childMap[i.depends_on].push(i); } });
+        var descStack = [nodeId];
+        while (descStack.length > 0) {
+          var pid = descStack.pop();
+          (childMap[pid] || []).forEach(function(c) { chainIds[c.id] = true; descStack.push(c.id); });
+        }
+
         allArrows().forEach(function(el) {
           var from = el.getAttribute('data-from');
           var to = el.getAttribute('data-to');
-          if (String(from) === nodeId || String(to) === nodeId) {
+          if (chainIds[from] && chainIds[to]) {
             el.setAttribute('opacity', '1');
             el.setAttribute('stroke-width', '2.5');
             el.setAttribute('stroke', '#818cf8');
@@ -3282,14 +3443,15 @@ function renderFlowPage(rawData) {
           }
         });
         allNodes().forEach(function(gn) {
-          if (gn !== g) gn.querySelector('.flow-node-rect').setAttribute('opacity', '0.3');
+          var nid = gn.getAttribute('data-id');
+          if (!chainIds[nid]) gn.querySelector('.flow-node-rect').setAttribute('opacity', '0.3');
         });
       });
       g.addEventListener('mouseleave', function() {
         resetHighlight();
       });
 
-      // Click: show detail panel
+      // Click: show detail panel with full dependency chain
       g.addEventListener('click', function() {
         var item = (cache.items||[]).find(function(i) { return String(i.id) === nodeId; });
         if (!item) return;
@@ -3297,20 +3459,108 @@ function renderFlowPage(rawData) {
         var titleEl = document.getElementById('flow-detail-title');
         var bodyEl = document.getElementById('flow-detail-body');
         if (!panel || !titleEl || !bodyEl) return;
+
+        // ── Walk ancestor chain (depends_on → depends_on → ...) ──────────────
+        var ancestorChain = [];
+        var visited = {};
+        var curId = item.depends_on;
+        while (curId && !visited[curId]) {
+          visited[curId] = true;
+          var ancestor = (cache.items||[]).find(function(i) { return i.id === curId; });
+          if (!ancestor) break;
+          ancestorChain.push(ancestor);
+          curId = ancestor.depends_on;
+        }
+
+        // ── Walk descendant chain (items that depend on this, recursively) ──
+        var byParentId = {};
+        (cache.items||[]).forEach(function(i) {
+          if (i.depends_on) {
+            if (!byParentId[i.depends_on]) byParentId[i.depends_on] = [];
+            byParentId[i.depends_on].push(i);
+          }
+        });
+        var descendantChain = [];
+        var descVisited = {};
+        var descStack = [item.id];
+        while (descStack.length > 0) {
+          var parentId = descStack.pop();
+          if (descVisited[parentId]) continue;
+          descVisited[parentId] = true;
+          var children = byParentId[parentId] || [];
+          children.forEach(function(c) {
+            descendantChain.push(c);
+            descStack.push(c.id);
+          });
+        }
+
+        // ── Determine blocked status based on transitive ancestors ─────────
+        var incompleteAncestors = ancestorChain.filter(function(a) {
+          return a.status !== 'complete' && a.status !== 'cancelled' && a.status !== 'dropped';
+        });
+        var allDepsComplete = incompleteAncestors.length === 0;
+
         titleEl.textContent = '#' + item.id + ' ' + item.title;
-        var depItem = item.depends_on && (cache.items||[]).find(function(i) { return i.id === item.depends_on; });
-        var depText = item.depends_on
-          ? (depItem ? 'Blocked by #' + depItem.id + ' ' + depItem.title : 'Blocked by #' + item.depends_on)
-          : 'No blocker';
-        var depItems = (cache.items||[]).filter(function(i) { return i.depends_on === item.id; });
-        bodyEl.innerHTML =
-          '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px">STATUS</span><br>'
-          + '<span class="badge ' + (item.status==='complete'?'badge-complete':item._is_blocked?'badge-blocked':item.status==='in-progress'?'badge-in-progress':'badge-open') + '">' + esc(item._is_blocked?'blocked':item.status) + '</span>'
+
+        // ── Build ancestor chain HTML ───────────────────────────────────────
+        var ancestorHtml = '';
+        if (ancestorChain.length > 0) {
+          ancestorHtml = '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px;text-transform:uppercase;font-weight:600">ANCESTOR CHAIN (UPSTREAM DEPENDENCIES)</span><br>';
+          ancestorHtml += '<div style="margin-top:4px">';
+          ancestorChain.forEach(function(a, idx) {
+            var isComplete = a.status === 'complete' || a.status === 'cancelled' || a.status === 'dropped';
+            var statusColor = isComplete ? '#22c55e' : (a.status === 'in-progress' ? '#eab308' : '#ef4444');
+            var arrow = idx < ancestorChain.length - 1 ? ' <span style="color:#4b5563">→</span> ' : '';
+            ancestorHtml += '<span class="badge badge-num" style="margin-right:2px">#' + a.id + '</span> '
+              + '<span style="color:' + statusColor + ';font-size:11px">' + esc(a.title.slice(0,25)) + (a.title.length > 25 ? '…' : '') + '</span>'
+              + ' <span style="font-size:10px;color:#64748b">(' + esc(a.status) + ')</span>'
+              + arrow;
+          });
+          ancestorHtml += '</div></div>';
+        } else {
+          ancestorHtml = '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px;text-transform:uppercase;font-weight:600">ANCESTOR CHAIN</span><br><span style="font-size:12px;color:#64748b">No dependencies — this is a root task</span></div>';
+        }
+
+        // ── Build descendant chain HTML ──────────────────────────────────────
+        var descendantHtml = '';
+        if (descendantChain.length > 0) {
+          descendantHtml = '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px;text-transform:uppercase;font-weight:600">DESCENDANT CHAIN (BLOCKS DOWNSTREAM)</span><br>';
+          descendantHtml += '<div style="margin-top:4px">';
+          descendantChain.slice(0, 8).forEach(function(d) {
+            var statusColor = d.status === 'complete' ? '#22c55e' : (d.status === 'in-progress' ? '#eab308' : '#64748b');
+            descendantHtml += '<div style="margin-left:4px;padding:1px 0"><span class="badge badge-num">#' + d.id + '</span> '
+              + '<span style="color:' + statusColor + ';font-size:11px">' + esc(d.title.slice(0,30)) + (d.title.length > 30 ? '…' : '') + '</span>'
+              + ' <span style="font-size:10px;color:#64748b">(' + esc(d.status) + ')</span></div>';
+          });
+          if (descendantChain.length > 8) {
+            descendantHtml += '<div style="font-size:11px;color:#64748b;margin-left:4px">+ ' + (descendantChain.length - 8) + ' more</div>';
+          }
+          descendantHtml += '</div></div>';
+        }
+
+        // ── Readiness banner ────────────────────────────────────────────────
+        var readinessHtml = '';
+        if (item.status === 'complete' || item.status === 'cancelled' || item.status === 'dropped') {
+          // already done — no readiness message
+        } else if (item._is_blocked || incompleteAncestors.length > 0) {
+          readinessHtml = '<div style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px">'
+            + '<span style="color:#ef4444;font-weight:600">⏸ Blocked</span> — '
+            + incompleteAncestors.length + ' incomplete ancestor(s). Cannot start until all upstream dependencies are complete.'
+            + '</div>';
+        } else {
+          readinessHtml = '<div style="background:rgba(34,197,94,0.1);border:1px solid rgba(34,197,94,0.3);border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px">'
+            + '<span style="color:#22c55e;font-weight:600">✓ Ready</span> — All dependencies complete. This task can be started now.'
+            + '</div>';
+        }
+
+        bodyEl.innerHTML = readinessHtml
+          + '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px">STATUS</span><br>'
+          + '<span class="badge ' + (item.status==='complete'?'badge-complete':item._is_blocked?'badge-blocked':item.status==='in-progress'?'badge-in-progress':item._is_ready?'badge-ready':'badge-open') + '">' + esc(item._is_blocked?'blocked':item._is_ready?'ready':item.status) + '</span>'
           + ' <span class="badge ' + (item.priority==='critical'?'badge-critical':item.priority==='high'?'badge-high':item.priority==='medium'?'badge-medium':'badge-low') + '">' + esc(item.priority||'—') + '</span>'
           + '</div>'
-          + (item.plan_description ? '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px">REQUIRED</span><br><span style="font-size:12px">' + esc(item.plan_description.slice(0,200)) + (item.plan_description.length>200?'…':'') + '</span></div>' : '')
-          + '<div style="margin-bottom:6px"><span style="color:#64748b;font-size:11px">DEPENDS ON</span><br><span style="font-size:12px">' + esc(depText) + '</span></div>'
-          + (depItems.length ? '<div><span style="color:#64748b;font-size:11px">BLOCKS</span><br>' + depItems.map(function(d) { return '<span class="badge badge-num">#'+d.id+'</span> '+esc(d.title.slice(0,30)); }).join('<br>') + '</div>' : '');
+          + (item.plan_description ? '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px">DESCRIPTION</span><br><span style="font-size:12px">' + esc(item.plan_description.slice(0,200)) + (item.plan_description.length>200?'…':'') + '</span></div>' : '')
+          + ancestorHtml
+          + descendantHtml;
         panel.style.display = 'block';
       });
     });
@@ -3362,7 +3612,7 @@ function renderSessionsPage(data) {
     + '<div class="filter-group"><label>Interface</label><select onchange="sessFilter.interface=this.value;sessPage=1;redrawSessions()">'+ifaceOpts+'</select></div>'
     + '<div class="filter-group"><label>From</label><input type="date" value="'+sessFilter.dateFrom+'" onchange="sessFilter.dateFrom=this.value;sessPage=1;redrawSessions()"></div>'
     + '<div class="filter-group"><label>To</label><input type="date" value="'+sessFilter.dateTo+'" onchange="sessFilter.dateTo=this.value;sessPage=1;redrawSessions()"></div>'
-    + '<button class="clear-btn" onclick="sessFilter={search:\\'\\',interface:\\'\\',dateFrom:\\'\\',dateTo:\\'\\'};sessPage=1;renderSessionsPage(cache.sessions||[])">Clear</button>'
+    + '<button class="clear-btn" onclick="sessFilter={search:&#39;&#39;,interface:&#39;&#39;,dateFrom:&#39;&#39;,dateTo:&#39;&#39;};sessPage=1;renderSessionsPage(cache.sessions||[])">Clear</button>'
     + '</div>'
     + '<div class="result-count" id="sess-count"></div>'
     + '<div class="table-wrap">'
@@ -3455,16 +3705,16 @@ function renderCyclesPage(data) {
 
   $('pageContent').innerHTML = '<div class="filter-bar">'
     + '<div class="filter-group"><label>Phase</label><div class="check-group">'
-    + ['plan','do','check','act'].map(p=>'<label class="check-pill'+(cyclesFilter.phase.includes(p)?' checked':'')+'"><input type="checkbox" '+(cyclesFilter.phase.includes(p)?'checked':'')+' onchange="toggleFilter(cyclesFilter.phase,\\''+p+'\\',this.checked);this.parentElement.classList.toggle(\\'checked\\',this.checked);cyclesPage=1;redrawCycles()"> '+p+'</label>').join('')
+    + ['plan','do','check','act'].map(p=>'<label class="check-pill'+(cyclesFilter.phase.includes(p)?' checked':'')+'"><input type="checkbox" '+(cyclesFilter.phase.includes(p)?'checked':'')+' onchange="toggleFilter(cyclesFilter.phase,&#39;'+p+'&#39;,this.checked);this.parentElement.classList.toggle(&#39;checked&#39;,this.checked);cyclesPage=1;redrawCycles()"> '+p+'</label>').join('')
     + '</div></div>'
     + '<div class="filter-group"><label>Outcome</label><div class="check-group">'
-    + ['pass','fail','partial','skipped'].map(o=>'<label class="check-pill'+(cyclesFilter.outcome.includes(o)?' checked':'')+'"><input type="checkbox" '+(cyclesFilter.outcome.includes(o)?'checked':'')+' onchange="toggleFilter(cyclesFilter.outcome,\\''+o+'\\',this.checked);this.parentElement.classList.toggle(\\'checked\\',this.checked);cyclesPage=1;redrawCycles()"> '+o+'</label>').join('')
+    + ['pass','fail','partial','skipped'].map(o=>'<label class="check-pill'+(cyclesFilter.outcome.includes(o)?' checked':'')+'"><input type="checkbox" '+(cyclesFilter.outcome.includes(o)?'checked':'')+' onchange="toggleFilter(cyclesFilter.outcome,&#39;'+o+'&#39;,this.checked);this.parentElement.classList.toggle(&#39;checked&#39;,this.checked);cyclesPage=1;redrawCycles()"> '+o+'</label>').join('')
     + '</div></div>'
     + '<div class="filter-group"><label>Agent</label><select onchange="cyclesFilter.agent=this.value;cyclesPage=1;redrawCycles()">'+agentOpts+'</select></div>'
     + '<div class="filter-group"><label>Item ID</label><input type="text" placeholder="e.g. 42" style="width:80px" value="'+esc(cyclesFilter.itemId)+'" oninput="cyclesFilter.itemId=this.value;cyclesPage=1;redrawCycles()"></div>'
     + '<div class="filter-group"><label>From</label><input type="date" value="'+cyclesFilter.dateFrom+'" onchange="cyclesFilter.dateFrom=this.value;cyclesPage=1;redrawCycles()"></div>'
     + '<div class="filter-group"><label>To</label><input type="date" value="'+cyclesFilter.dateTo+'" onchange="cyclesFilter.dateTo=this.value;cyclesPage=1;redrawCycles()"></div>'
-    + '<button class="clear-btn" onclick="cyclesFilter={phase:[],outcome:[],agent:\\'\\',itemId:\\'\\',dateFrom:\\'\\',dateTo:\\'\\'};cyclesPage=1;renderCyclesPage(cache.cycles||[])">Clear</button>'
+    + '<button class="clear-btn" onclick="cyclesFilter={phase:[],outcome:[],agent:&#39;&#39;,itemId:&#39;&#39;,dateFrom:&#39;&#39;,dateTo:&#39;&#39;};cyclesPage=1;renderCyclesPage(cache.cycles||[])">Clear</button>'
     + '</div>'
     + '<div class="result-count" id="cycles-count"></div>'
     + '<div class="table-wrap">'
@@ -3560,7 +3810,7 @@ function renderFileChangesPage(data) {
     + '<div class="filter-group"><label>Git Commit</label><input type="text" placeholder="commit hash" style="width:120px" value="'+esc(fcFilter.commit)+'" oninput="fcFilter.commit=this.value;fcPage=1;redrawFC()"></div>'
     + '<div class="filter-group"><label>From</label><input type="date" value="'+fcFilter.dateFrom+'" onchange="fcFilter.dateFrom=this.value;fcPage=1;redrawFC()"></div>'
     + '<div class="filter-group"><label>To</label><input type="date" value="'+fcFilter.dateTo+'" onchange="fcFilter.dateTo=this.value;fcPage=1;redrawFC()"></div>'
-    + '<button class="clear-btn" onclick="fcFilter={search:\\'\\',changeType:\\'\\',itemId:\\'\\',commit:\\'\\',dateFrom:\\'\\',dateTo:\\'\\'};fcPage=1;renderFileChangesPage(cache[\\'file-changes\\']||[])">Clear</button>'
+    + '<button class="clear-btn" onclick="fcFilter={search:&#39;&#39;,changeType:&#39;&#39;,itemId:&#39;&#39;,commit:&#39;&#39;,dateFrom:&#39;&#39;,dateTo:&#39;&#39;};fcPage=1;renderFileChangesPage(cache[&#39;file-changes&#39;]||[])">Clear</button>'
     + '</div>'
     + '<div class="result-count" id="fc-count"></div>'
     + '<div class="table-wrap">'
@@ -3660,7 +3910,7 @@ function renderActivitiesPage(data) {
     + '<div class="filter-group"><label>Type</label><select onchange="actFilter.type=this.value;actPage=1;redrawActivities()">'+typeOpts+'</select></div>'
     + '<div class="filter-group"><label>Status</label><select onchange="actFilter.status=this.value;actPage=1;redrawActivities()">'+statusOpts+'</select></div>'
     + '<div class="filter-group"><label>Agent</label><select onchange="actFilter.agent=this.value;actPage=1;redrawActivities()">'+agentOpts+'</select></div>'
-    + '<button class="clear-btn" onclick="actFilter={search:\\'\\',status:\\'\\',type:\\'\\',agent:\\'\\'};actPage=1;renderActivitiesPage(cache.activities||[])">Clear</button>'
+    + '<button class="clear-btn" onclick="actFilter={search:&#39;&#39;,status:&#39;&#39;,type:&#39;&#39;,agent:&#39;&#39;};actPage=1;renderActivitiesPage(cache.activities||[])">Clear</button>'
     + '</div>'
     + '<div class="result-count" id="act-count"></div>'
     + '<div class="table-wrap">'
@@ -3727,7 +3977,7 @@ function redrawActivities() {
     const eid = 'ex-act-' + a.id;
     const hasDetail = a.detail || a.files_modified;
     const files = parseArr(a.files_modified);
-    const pdcaLink = a.pdca_item_id ? '<a href="#" onclick="navigateTo(\\'items\\');setTimeout(function(){window.location.hash=\\'item-'+a.pdca_item_id+'\\'},100);return false;" class="badge badge-num">#'+a.pdca_item_id+'</a>' : '—';
+    const pdcaLink = a.pdca_item_id ? '<a href="#" onclick="navigateTo(&#39;items&#39;);setTimeout(function(){window.location.hash=&#39;item-'+a.pdca_item_id+'&#39;},100);return false;" class="badge badge-num">#'+a.pdca_item_id+'</a>' : '—';
     return '<tr class="'+(hasDetail?'clickable-row':'')+'" '+(hasDetail?'data-expand="'+eid+'"':'')+' title="'+(hasDetail?'Click to expand':'')+'">'
       + '<td class="mono">#'+a.id+'</td>'
       + '<td class="dim">' + timeAgoCell(a.created_at) + '</td>'
