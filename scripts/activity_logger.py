@@ -381,7 +381,7 @@ def main():
     p_log.add_argument("--target", default=None, help="Target agent for delegations")
     p_log.add_argument("--purpose", default=None, help="Delegation purpose")
     p_log.add_argument("--confidence", default=None, choices=VALID_CONFIDENCES)
-    p_log.add_argument("--project", default="expresolve")
+    p_log.add_argument("--project", default="global")
     p_log.add_argument("--duration", type=float, default=None)
     p_log.add_argument(
         "--pdca-item", type=int, default=None, help="Link to PDCA item ID"
@@ -415,11 +415,11 @@ def main():
 
     # summary
     p_sum = sub.add_parser("summary", help="Show project summary")
-    p_sum.add_argument("--project", default="expresolve")
+    p_sum.add_argument("--project", default="global")
 
     # orphans
     p_orphans = sub.add_parser("orphans", help="Show activities without PDCA links")
-    p_orphans.add_argument("--project", default="expresolve")
+    p_orphans.add_argument("--project", default="global")
 
     # link
     p_link = sub.add_parser("link", help="Link an activity to a PDCA item")
@@ -431,7 +431,7 @@ def main():
     p_cov = sub.add_parser(
         "pdca-coverage", help="Show PDCA items with their activity coverage"
     )
-    p_cov.add_argument("--project", default="expresolve")
+    p_cov.add_argument("--project", default="global")
 
     # recent
     p_recent = sub.add_parser("recent", help="Show last N activities")

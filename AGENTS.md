@@ -1,3 +1,9 @@
+# Master Rule: PDCA-First Implementation
+
+**Source of truth:** `/root/projects/vault/instructions/PDCA-FIRST.md` (auto-loaded by Kilo into every session). All implementation across all products must be tracked via PDCA items before code changes. No ghost commits.
+
+---
+
 # Repository Guidelines
 
 ## Project Structure & Module Organization
@@ -52,7 +58,7 @@ This dashboard is an **orchestration layer** that governs multiple projects on t
 
 - **Dashboard URL:** `pdca.konzult.in` → Caddy → `localhost:7010`
 - **PM2 Process:** `pdca-dashboard`
-- **Database:** `/root/data/assistant/tasks.db` (SQLite)
+- **Database:** `/root/data/assistant/tasks.db` (SQLite, WAL mode)
 - **Auth:** `ashish@konzult.in` (credentials in server.js)
 
 ```bash
@@ -60,15 +66,41 @@ pm2 restart pdca-dashboard   # Restart after edits
 pm2 logs pdca-dashboard --lines 20 --nostream  # Check logs
 ```
 
+## Architecture
+
+```
+Telegram ──► Claude Channels ──► orchestrator.sh
+                                            │
+           ┌─────────────────────────────────┴────────────────────────┐
+           │                                                          │
+    pdca-workbuddy-trigger.sh                   pdca-queue-processor.sh
+    (WorkBuddy autonomous cycle)                (general queue dispatcher)
+    every 15 min cron                          every 2 min cron + on-demand
+           │                                            │
+    pdca-workbuddy-worker.sh                     pdca-v2-phase-worker.sh
+    (WorkBuddy-specific agent)                  (general phase worker)
+           │                                            │
+           └──────────────────────────┬─────────────────┘
+                                      │
+                              pdca-items table
+                                      │
+                        ┌─────────────┼─────────────────┐
+                        │             │                  │
+                    Dashboard    pdca-stuck-reset    pdca-escalate
+                    (UI :7010)    (every 30 min)      (manual)
+```
+
 ## Projects Under Orchestration
 
-| Project ID | Directory | Agent | Description |
-|------------|-----------|-------|-------------|
-| `WorkBuddy` | `/root/projects/workbuddy` | workbuddy-agent | Sales CRM (React Native) |
-| `ERP` | `/root/projects/ERP` | erp-agent | Manufacturing ERP |
-| `pdca-ui` | `/root/projects/pdca-ui` | ops-agent | This dashboard |
-| `Konzult` | `/root/projects/sitegen` | konzult-agent | Website builder |
-| `Pulse` | `/root/projects/pulse` | pulse-agent | AI chief of staff |
+| Project ID | Directory | Agent | Check Strategy | Description |
+|------------|-----------|-------|---------------|-------------|
+| `WorkBuddy` | `/root/projects/workbuddy` | workbuddy-agent | `expo-start` | Sales CRM (React Native) |
+| `ERP` | `/root/projects/ERP` | erp-agent | `server-smoke` | Manufacturing ERP |
+| `pdca-ui` | `/root/projects/pdca-ui` | ops-agent | `server-smoke` | This dashboard |
+| `Konzult` | `/root/projects/sitegen` | konzult-agent | `curl-endpoint` | Website builder |
+| `Pulse` | `/root/projects/pulse` | pulse-agent | `typecheck` | AI chief of staff |
+
+Stored in `pdca_projects` table with `max_iterations=3` per item chain.
 
 ## PDCA Serial Number System
 
@@ -100,40 +132,167 @@ plan → do → check → act
 
 ## PDCA v2 Chain System
 
-Items can be chained together for iterative improvement:
+Each **improvement chain** is a series of related PDCA items. An item is born from the previous phase and carries chain context.
 
-| Field | Description |
-|-------|-------------|
-| `source_id` | ID of the item that triggered this one |
-| `chain_root_id` | ID of the root item in the chain |
-| `iteration` | Iteration number (1, 2, 3...) |
-| `chain_status` | Current status of the whole chain |
+**Chain fields:**
+
+| Field | Meaning |
+|-------|---------|
+| `chain_root_id` | ID of the root item in the chain — same for whole chain |
+| `source_id` | ID of the item that *spawned* this one (direct parent) |
+| `iteration` | 1-based iteration number within the chain |
+| `chain_status` | `active` → one phase incomplete · `complete` → all phases done · `abandoned` → cancelled/dropped |
 | `escalated_to` | Agent escalated to (e.g., `planner`) |
-| `check_verdict` | pass / partial / fail |
-| `check_score` | 0-100 quality score |
+| `check_verdict` | `pass` · `partial` · `fail` — set by check phase |
+| `check_score` | 0–100 quality score from check phase |
+| `act_learnings` | Documentation of what was learned |
+| `stuck_count` | How many times this item has been auto-reset from in-progress |
+
+**Chain flow:**
+
+```
+plan item (source_id: null, chain_root: own_id, iteration: 1)
+    └─► do item (source_id: plan_id, chain_root: same, iteration: 1)
+            └─► check item (source_id: do_id, same chain, iteration: 1)
+                    ├─► pass → act item (source_id: check_id) → chain complete
+                    └─► fail/partial → act item + new plan item (iteration: 2)
+```
+
+**Max iterations:** 3 per chain (enforced by `pdca_projects.max_iterations`).
 
 ## Database Schema
 
+### pdca_items (core table)
+
 ```sql
--- Main items table
 pdca_items (
-  id, project_id, slug, title, phase, status, priority, category,
-  plan_description, actual_description, remarks, errors_encountered,
-  files_modified, estimated_mins, actual_mins, agent_assigned,
-  depends_on, created_at, started_at, completed_at, due_date, cycle_count,
-  -- PDCA v2 fields:
-  source_id, chain_root_id, iteration, chain_status, escalated_to,
-  check_verdict, check_score, check_evidence, act_learnings
+  id                  INTEGER PRIMARY KEY
+, project_id          TEXT     -- references pdca_projects.project_id
+, slug                TEXT     -- unique within project
+, title               TEXT
+, phase               TEXT     -- plan | do | check | act
+, status              TEXT     -- open | queued | in-progress | blocked | complete | cancelled | dropped
+, priority            TEXT     -- critical | high | medium | low
+, category            TEXT     -- feature | bug | security | docs | infra | research
+, plan_description    TEXT     -- spec for plan phase, summary for do phase
+, actual_description TEXT
+, remarks             TEXT
+, errors_encountered  TEXT
+, files_modified      TEXT     -- JSON array of file paths
+, estimated_mins      INTEGER
+, actual_mins         INTEGER
+, agent_assigned      TEXT     -- workbuddy-agent | erp-agent | konzult-agent | ops-agent | pulse-agent
+, doc_path            TEXT     -- path to spec/design doc
+, depends_on          INTEGER  -- FK to another pdca_items.id (dependency chain)
+, started_at          DATETIME
+, completed_at        DATETIME
+, due_date            DATE
+, cycle_count         INTEGER
+, source_id           TEXT     -- PDCA v2: points to original item that spawned this
+, chain_root_id       TEXT     -- PDCA v2: root of this improvement chain
+, iteration           TEXT     -- PDCA v2: iteration number (1, 2, 3...)
+, chain_status        TEXT     -- PDCA v2: active | complete | abandoned
+, escalated_to        TEXT     -- PDCA v2: planner | specific agent
+, check_verdict       TEXT     -- PDCA v2: pass | partial | fail
+, check_score         TEXT     -- PDCA v2: 0-100 score
+, check_evidence      TEXT     -- PDCA v2: check phase findings
+, act_learnings       TEXT     -- PDCA v2: learnings JSON
+, stuck_count         INTEGER  -- PDCA v2: how many times reset from stuck
+, notified_at         DATETIME
+, project_dir         TEXT
+, hypothesis          TEXT     -- PDCA v2: lean hypothesis
+, acceptance_criteria TEXT     -- PDCA v2: criteria for check phase
+, check_gaps          TEXT     -- PDCA v2: gaps found in check
+, UNIQUE(project_id, slug)
 )
-
--- Projects table
-pdca_projects (
-  project_id, project_dir, default_agent, max_iterations, check_strategy, active
-)
-
--- PDCA cycle history
-pdca_cycles (id, project_id, phase, plan_notes, actual_notes, outcome, ...)
+Indexes: idx_pdca_chain_root, idx_pdca_source, idx_pdca_status_phase
 ```
+
+### pdca_cycles (phase execution log — one row per phase run)
+
+```sql
+pdca_cycles (
+  id            INTEGER PRIMARY KEY
+, item_id       INTEGER  -- FK to pdca_items
+, session_id    INTEGER
+, project_id    TEXT
+, phase         TEXT     -- plan | do | check | act
+, outcome       TEXT     -- pass | fail | partial | blocked | skipped
+, agent_used    TEXT
+, git_commit    TEXT
+, plan_notes    TEXT
+, actual_notes  TEXT
+, errors        TEXT
+, remarks       TEXT
+, started_at    DATETIME
+, ended_at      DATETIME
+, duration_mins INTEGER
+)
+```
+
+### pdca_sessions (grouped batch of cycles)
+
+```sql
+pdca_sessions (
+  id               INTEGER PRIMARY KEY
+, project_id       TEXT
+, cycles_requested INTEGER
+, cycles_completed INTEGER
+, items_promoted   TEXT  -- JSON array of pdca_item IDs
+, items_failed     TEXT  -- JSON array
+, summary          TEXT
+, interface        TEXT  -- vscode | telegram | terminal
+, started_at       DATETIME
+, ended_at         DATETIME
+)
+```
+
+### pdca_file_changes (files touched per cycle)
+
+```sql
+pdca_file_changes (
+  id          INTEGER PRIMARY KEY
+, item_id     INTEGER  -- FK to pdca_items
+, cycle_id    INTEGER
+, session_id  INTEGER
+, project_id  TEXT
+, file_path   TEXT
+, change_type TEXT     -- added | modified | deleted | renamed
+, old_path    TEXT
+, git_commit  TEXT
+, description TEXT
+, changed_at  DATETIME
+)
+```
+
+### pdca_logs (live agent output stream)
+
+```sql
+pdca_logs (
+  id         INTEGER PRIMARY KEY
+, item_id    INTEGER  -- FK to pdca_items
+, line       TEXT
+, created_at DATETIME
+)
+```
+
+### pdca_projects (project registry)
+
+```sql
+pdca_projects (
+  project_id      TEXT PRIMARY KEY
+, project_dir     TEXT
+, default_agent   TEXT
+, max_iterations  INTEGER  -- default 3
+, check_strategy  TEXT     -- typecheck | server-smoke | curl-endpoint | expo-start | manual
+, active          INTEGER  -- 1 or 0
+)
+```
+
+### Views
+
+- **`pdca_performance`** — per-project aggregate: total, completed, in-progress, blocked, open, cancelled, estimation ratio, completion %
+- **`pdca_next_actions`** — open/queued items sorted by priority, excluding blocked ones
 
 ### Query Examples
 
@@ -155,10 +314,12 @@ sqlite3 /root/data/assistant/tasks.db "SELECT * FROM pdca_items WHERE chain_root
 
 | Script | Purpose | Run Frequency |
 |--------|---------|---------------|
-| `pdca-queue-processor.sh` | Dispatch queued items to agents | Every 2 min (cron) |
-| `pdca-v2-phase-worker.sh` | Execute a single PDCA item (phase-aware) | On-demand |
+| `pdca-queue-processor.sh` | Dispatch queued items to agents | Every 2 min (cron) + on-demand |
+| `pdca-v2-phase-worker.sh` | Phase worker — picks up from queue processor, builds phase-specific prompt, calls Claude | On-demand |
 | `pdca-stuck-reset.sh` | Detect stuck items, auto-reset/escalate | Every 30 min (cron) |
 | `pdca-escalate.sh` | Manual escalation to different agent | Manual |
+| `pdca-workbuddy-trigger.sh` | WorkBuddy autonomous trigger — probes Claude, reverts stale queued, claims up to 3 items, spawns workers, sends Telegram summary | Every 15 min (cron) |
+| `pdca-workbuddy-worker.sh` | WorkBuddy-specific worker (called by trigger) | On-demand |
 
 ### Queue Processor Safety Guards
 
@@ -190,24 +351,105 @@ Agents are assigned based on `project_id`:
 | (fallback) | general-purpose | Sonnet |
 | (planning) | planner | Opus |
 
-## PDCA API Endpoints
+## Dashboard Pages
 
-```bash
-# Get items for a project
-GET /api/items?project=WorkBuddy
+The UI has 7 pages:
 
-# Get chains view
-GET /api/chains?project=pdca-ui
+| Page | Route | Data |
+|------|-------|------|
+| **Overview** | `/` | Performance chips per project, done-this-week feed, activity feed |
+| **Items** | `/items` | Sortable/filterable table, by-project, open/queued/in-progress/blocked views, traffic light dots, item cards (mobile), real-time SSE log modal |
+| **Gantt** | `/gantt` | SVG dependency chart, topological sort, critical path highlighting, today marker |
+| **Chains** | `/chains` | Chain grouping by `chain_root_id`, iteration status, check scores |
+| **Sessions** | `/sessions` | Batch session history per project |
+| **Cycles** | `/cycles` | All phase executions with outcome badges |
+| **File Changes** | `/file-changes` | Files modified per item/cycle/project |
 
-# Queue an item (triggers queue processor)
-POST /api/items/:id/queue
+### Traffic Light System
 
-# Get cycles
-GET /api/cycles?project=WorkBuddy
+Each item gets a colored dot:
+- 🔴 **Red** — blocked (dependency not complete) or status=`blocked`
+- 🟡 **Amber** — in-progress or check phase active
+- 🟢 **Green** — complete
+- 🟣 **Purple** — queued (dispatched, waiting for LLM)
+- ⚫ **Gray** — open/not started
 
-# Get next actions
-GET /api/next-actions?project=WorkBuddy
+### Live Log Streaming (SSE)
+
+Click any in-progress item → real-time log stream via Server-Sent Events at `GET /api/items/:id/logs/stream`. Worker appends to `pdca_logs`. UI polls every 2s via `EventSource`.
+
+## API Endpoints
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/projects` | List all project IDs |
+| GET | `/api/performance?project=X` | Project performance aggregates |
+| GET | `/api/items?project=X` | All items for a project (full detail) |
+| GET | `/api/sessions?project=X` | Recent sessions |
+| GET | `/api/next-actions?project=X` | Open items not blocked |
+| GET | `/api/cycles?project=X&limit=N` | Cycles history |
+| GET | `/api/file-changes?project=X&limit=N` | File changes |
+| GET | `/api/chains?project=X` | Chain groups |
+| POST | `/api/items/:id/queue` | Queue a single item (open→queued), fires queue processor |
+| POST | `/api/trigger-cycle` | Manually run trigger cycle (WorkBuddy) |
+| GET | `/api/items/:id/logs` | All logs for item |
+| GET | `/api/items/:id/logs/stream` | SSE live log stream |
+| POST | `/api/items/:id/logs` | Append a log line |
+| GET/POST | `/login`, `/logout` | Auth |
+
+## Auto-Operation (Zero-Human Workflow)
+
 ```
+Telegram message "run pdca" or cron tick (15 min)
+    │
+    ▼
+pdca-workbuddy-trigger.sh
+    │  1. Probe Claude availability (backoff if rate-limited)
+    │  2. Auto-revert stale queued items (>30min unclaimed → open)
+    │  3. Claim up to 3 open items (atomic UPDATE)
+    │  4. Spawn workers in parallel
+    ▼
+pdca-workbuddy-worker.sh / pdca-v2-phase-worker.sh
+    │  1. Set status = in-progress
+    │  2. cd into project_dir
+    │  3. Call Claude with phase-specific prompt + chain context
+    │  4. Worker creates next-phase item with chain fields
+    │  5. Worker marks self complete/partial/blocked
+    │  6. Output "PDCA_RESULT:outcome|detail"
+    ▼
+Trigger collects results → Telegram summary
+    │
+    ▼ (next 15-min tick or 2-min queue processor if new items queued)
+pdca-queue-processor.sh (general)
+    │  1. Resource guards
+    │  2. Per-agent: skip if already busy
+    │  3. Dispatch highest-priority queued item per agent
+    ▼
+pdca-stuck-reset.sh (every 30 min)
+    │  stuck >120min → reset to queued
+    │  stuck >60min  → escalate to planner
+    ▼
+```
+
+**Concurrency:** Max 5 global in-progress; unlimited agents but typically 1 per project.
+
+## Agent Prompts (PDCA v2)
+
+Each worker receives a system prompt defining its phase. Key rules:
+- Always `cd` to `$PDCA_PROJECT_DIR` before working
+- Create next phase item with `source_id`, `chain_root_id`, `iteration` fields
+- Mark self `complete` (or `blocked` / `partial`) when done
+- Only escalate to `planner` (Opus) for architecture/refactoring or if `escalated_to=planner`
+- Parse Claude output for `PDCA_RESULT:outcome|detail` line
+- Max iteration enforcement: if `iteration >= max_iterations` (from `pdca_projects`), halt the chain
+
+## Known Gaps / TODOs
+
+- `pdca-migrate-v2.sh` ran a one-time schema migration (chain columns + `pdca_projects` table); check it for v2 schema completeness.
+- Project mapping in `pdca-queue-processor.sh` hardcodes paths for known projects; new projects need manual entry.
+- Chaining logic lives in the Claude LLM prompts (worker scripts), not in SQL — chain integrity depends on LLM following instructions.
+- `check_strategy` (how to verify) is declarative but not auto-executed — LLM decides how to implement it.
+- `pdca_v2_phase_worker.sh` is the active worker; `pdca-workbuddy-worker.sh` coexists but may be WorkBuddy-specific fallback.
 
 ## Quick Reference
 

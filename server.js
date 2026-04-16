@@ -9,7 +9,7 @@ const bcrypt = require('bcryptjs');
 const PORT = 7010;
 const DB_PATH = '/root/data/assistant/tasks.db';
 const AUTH_USER = 'ashish@konzult.in';
-const AUTH_HASH = '$2a$14$WDKpUrU7Xiu.QWRb4ZFq5.OQjIGCu6HmAl8pBP3Zu9AKhoXrniNsS';
+const AUTH_HASH = '$2b$14$N0/MVQbizO9uAx/6AP6dWO6EKsRTMixRdQjo/Kc/TMg2wXHwdyKXC';
 
 let db;
 
@@ -99,6 +99,119 @@ function requireAuth(req, res, next) {
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not authenticated' });
   res.redirect('/login');
 }
+
+// ── GlitchTip Webhook → PDCA Integration ──────────────────────────────────────
+// Receives error alerts from GlitchTip and auto-creates PDCA items.
+// Must be BEFORE the auth middleware since GlitchTip calls us without session.
+app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
+  try {
+    const body = req.body;
+    const data = body.data || body;
+    const issue = data.issue || {};
+
+    // Extract info from GlitchTip alert payload
+    const issueTitle = issue.title || data.title || data.message || 'Untitled Error';
+    const issueUrl = issue.url || '';
+    const projectSlug = (issue.project?.slug || data.project?.slug || 'unknown').toLowerCase();
+    const level = issue.level ?? data.level ?? 'error';
+    const culprit = issue.culprit || '';
+    const eventCount = issue.count || 1;
+    const userCount = issue.userCount || 0;
+    const firstSeen = issue.firstSeen || '';
+    const lastSeen = issue.lastSeen || '';
+    const tags = issue.tags || [];
+    const environment = (tags.find(t => t?.key === 'environment') || {}).value || 'production';
+    const release = (tags.find(t => t?.key === 'release') || {}).value || 'unknown';
+
+    // Map severity: fatal/critical → critical, error → high, warning → medium, else → low
+    let priority = 'medium';
+    if (level === 'fatal' || level === 4 || String(level) === 'critical') priority = 'critical';
+    else if (level === 'error' || level === 3) priority = 'high';
+    else if (level === 'warning' || level === 2) priority = 'medium';
+    else priority = 'low';
+
+    // Map project slug to PDCA project
+    let pdcaProjectId = 'WorkBuddy';
+    if (projectSlug.includes('native') || projectSlug.includes('mobile') || projectSlug.includes('app')) {
+      pdcaProjectId = 'WorkBuddy';
+    } else if (projectSlug.includes('backend') || projectSlug.includes('api') || projectSlug.includes('server')) {
+      pdcaProjectId = 'WorkBuddy';
+    }
+
+    // Build slug from title
+    const slugBase = issueTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+    const slug = 'glitch-' + slugBase + '-' + Date.now().toString(36);
+
+    // Rich description with source tracking
+    const planDesc = [
+      'Source: GlitchTip (glitchtip.konzult.in)',
+      'Project: ' + projectSlug,
+      'Environment: ' + environment,
+      'Level: ' + level,
+      'Release: ' + release,
+      'Occurrences: ' + eventCount,
+      'Users affected: ' + userCount,
+      lastSeen ? 'Last seen: ' + lastSeen : '',
+      firstSeen ? 'First seen: ' + firstSeen : '',
+      culprit ? 'Location: ' + culprit : '',
+      issueUrl ? 'GlitchTip URL: ' + issueUrl : '',
+      '---',
+      'This issue was auto-reported from the live production server.',
+      'Fix this and mark the PDCA item as complete.'
+    ].filter(Boolean).join('\n');
+
+    const actualDesc = 'Auto-created from GlitchTip alert. ' + eventCount + ' occurrence(s) from ' + environment + '. ' + userCount + ' user(s) affected.';
+
+    // Avoid duplicates: check if similar open issue exists
+    const existing = db.prepare(
+      "SELECT id, status FROM pdca_items WHERE project_id = ? AND title LIKE ? AND status IN ('open','in-progress','queued') ORDER BY id DESC LIMIT 1"
+    ).get(pdcaProjectId, '%' + issueTitle.slice(0, 50) + '%');
+
+    if (existing) {
+      // Update existing item with new occurrence info
+      db.prepare("UPDATE pdca_items SET actual_description = ?, updated_at = datetime('now','localtime') WHERE id = ?")
+        .run(actualDesc, existing.id);
+      db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))")
+        .run(existing.id, '[GlitchTip] Recurring error: +1 occurrence | Total: ' + eventCount + ' | Users: ' + userCount);
+      return res.json({ ok: true, action: 'updated', id: existing.id });
+    }
+
+    // Create new PDCA item
+    const result = db.prepare(`
+      INSERT INTO pdca_items (
+        project_id, slug, title, phase, status, priority, category,
+        plan_description, actual_description, agent_assigned,
+        created_at, started_at, hypothesis, acceptance_criteria
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'), ?, ?)
+    `).run(
+      pdcaProjectId,
+      slug,
+      '[GlitchTip] ' + issueTitle,
+      'plan',
+      'open',
+      priority,
+      'bug',
+      planDesc,
+      actualDesc,
+      'glitchtip-webhook',
+      'Error originates from ' + environment + ' environment on the live production server.',
+      'Error no longer appears in GlitchTip dashboard and no users are affected.'
+    );
+
+    const itemId = result.lastInsertRowid;
+
+    // Log the creation
+    db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))")
+      .run(itemId, '[GlitchTip] New error reported: ' + issueTitle + ' | Project: ' + projectSlug + ' | Env: ' + environment + ' | Level: ' + level + ' | Count: ' + eventCount);
+
+    console.log('[GlitchTip→PDCA] Created #' + itemId + ': ' + issueTitle + ' [' + priority + '] from ' + projectSlug);
+    res.json({ ok: true, action: 'created', id: itemId, slug, priority });
+  } catch (err) {
+    console.error('[GlitchTip→PDCA] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.use(requireAuth);
 
 // Request logger
@@ -250,6 +363,41 @@ app.get('/api/file-changes', (req, res) => {
       ORDER BY id DESC
       LIMIT ?
     `).all(project, lim);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/activities', (req, res) => {
+  try {
+    const { project, status, type, limit } = req.query;
+    if (!project) return res.status(400).json({ error: 'project param required' });
+    const lim = Math.min(parseInt(limit) || 200, 500);
+
+    // Match by: (1) direct project column, OR (2) linked PDCA item in this project, OR (3) global/cross-project activities
+    let whereClause = 'WHERE (a.project = ? OR a.project = ?)';
+    const params = [project, 'global'];
+    // Also include activities linked to PDCA items in this project
+    whereClause += ' OR a.pdca_item_id IN (SELECT id FROM pdca_items WHERE project_id = ?)';
+    params.push(project);
+
+    if (status) {
+      whereClause += ' AND a.status = ?';
+      params.push(status);
+    }
+
+    if (type) {
+      whereClause += ' AND a.activity_type = ?';
+      params.push(type);
+    }
+
+    const rows = db.prepare(`
+      SELECT a.* FROM activity_log a
+      ${whereClause}
+      ORDER BY a.id DESC
+      LIMIT ?
+    `).all(...params, lim);
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1199,12 +1347,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .badge-partial { background: rgba(234,179,8,0.15); color: var(--yellow); }
   .badge-blocked-out { background: rgba(239,68,68,0.15); color: var(--red); }
   .badge-skipped { background: rgba(100,116,139,0.1); color: var(--muted); }
-  .badge-plan  { background: rgba(168,85,247,0.15); color: var(--purple); }
-  .badge-do    { background: rgba(59,130,246,0.15); color: var(--blue); }
-  .badge-check { background: rgba(234,179,8,0.15); color: var(--yellow); }
-  .badge-act   { background: rgba(34,197,94,0.15); color: var(--green); }
-  .badge-ready { background: rgba(34,197,94,0.15); color: var(--green); }
-  .badge-num   { background: rgba(59,130,246,0.12); color: var(--blue); border-radius: 12px; }
+    .badge-plan  { background: rgba(168,85,247,0.15); color: var(--purple); }
+    .badge-do    { background: rgba(59,130,246,0.15); color: var(--blue); }
+    .badge-check { background: rgba(234,179,8,0.15); color: var(--yellow); }
+    .badge-act   { background: rgba(34,197,94,0.15); color: var(--green); }
+    .badge-ready { background: rgba(34,197,94,0.15); color: var(--green); }
+    .badge-num   { background: rgba(59,130,246,0.12); color: var(--blue); border-radius: 12px; }
+    .badge-medium { background: rgba(251,191,36,0.15); color: #fbbf24; }
+    .badge-low { background: rgba(100,116,139,0.15); color: var(--muted); }
 
   /* ── Misc ── */
   .loading { display: flex; align-items: center; justify-content: center; padding: 60px; color: var(--muted); gap: 12px; }
@@ -1439,9 +1589,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="nav-item" data-page="items"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 5h13M3.5 10h13M3.5 15h13"/><circle cx="1" cy="5" r="0.5" fill="currentColor"/><circle cx="1" cy="10" r="0.5" fill="currentColor"/><circle cx="1" cy="15" r="0.5" fill="currentColor"/></svg></span><span class="nav-label">Items</span></div>
     <div class="nav-item" data-page="gantt"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3.5" width="15" height="14" rx="2"/><path d="M6.5 2v3M13.5 2v3M2.5 8h15"/><circle cx="7" cy="12" r="1" fill="currentColor"/><circle cx="10" cy="12" r="1" fill="currentColor"/><circle cx="13" cy="12" r="1" fill="currentColor"/></svg></span><span class="nav-label">Gantt</span></div>
     <div class="nav-item" data-page="chains"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3a1.5 1.5 0 0 1 1.5-1.5h3.879a1.5 1.5 0 0 1 1.06.44l3.122 3.12a1.5 1.5 0 0 1 .44 1.06V15.5a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 4.5 15.5v-12z"/><path d="M8 7h4M8 10.5h4M8 14h2"/><circle cx="6" cy="7" r="0.75" fill="currentColor"/><circle cx="6" cy="10.5" r="0.75" fill="currentColor"/><circle cx="6" cy="14" r="0.75" fill="currentColor"/></svg></span><span class="nav-label">Chains</span></div>
+    <div class="nav-item" data-page="flow"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="4" cy="10" r="2.5"/><circle cx="16" cy="4" r="2.5"/><circle cx="16" cy="16" r="2.5"/><path d="M6.5 10h4.5M13.5 5.5l-4.5 3.5M13.5 14.5l-4.5-3.5"/></svg></span><span class="nav-label">Flow</span></div>
     <div class="nav-item" data-page="sessions"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h7l4 4v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M12 3v4h4M7 9h6M7 12h6M7 15h4"/></svg></span><span class="nav-label">Sessions</span></div>
     <div class="nav-item" data-page="cycles"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/><path d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/></svg></span><span class="nav-label">Cycles</span></div>
     <div class="nav-item" data-page="file-changes"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6a2 2 0 0 1 2-2h3.172a2 2 0 0 1 1.414.586l1.414 1.414H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6z"/></svg></span><span class="nav-label">File Changes</span></div>
+    <div class="nav-item" data-page="activities"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="nav-label">Activity Log</span></div>
   </nav>
   <div class="sb-footer">
     <button class="collapse-btn" id="collapseBtn">
@@ -1539,8 +1691,9 @@ let countdownSecs = 60;
 const PAGE_TITLES = {
   overview: 'Overview', items: 'Items',
   chains: 'Chains',
+  flow: 'Flow',
   sessions: 'Sessions',
-  cycles: 'Cycles', 'file-changes': 'File Changes'
+  cycles: 'Cycles', 'file-changes': 'File Changes', 'activities': 'Activity Log'
 };
 
 // Per-page cached data
@@ -1852,6 +2005,10 @@ async function loadPage(page) {
       const data = await apiFetch('/api/chains?project=' + p);
       cache.chains = data;
       renderChainsPage(data);
+    } else if (page === 'flow') {
+      const data = cache.items || await apiFetch('/api/items?project=' + p);
+      cache.items = data;
+      renderFlowPage(data);
     } else if (page === 'sessions') {
       const data = await apiFetch('/api/sessions?project=' + p);
       cache.sessions = data;
@@ -1868,6 +2025,10 @@ async function loadPage(page) {
       const data = await apiFetch('/api/file-changes?project=' + p + '&limit=200');
       cache['file-changes'] = data;
       renderFileChangesPage(data);
+    } else if (page === 'activities') {
+      const data = await apiFetch('/api/activities?project=' + p + '&limit=200');
+      cache.activities = data;
+      renderActivitiesPage(data);
     }
     updateLastUpdated();
     if (autoRefresh) { countdownSecs = 60; }
@@ -2121,6 +2282,7 @@ let itemsTab = 'not-started'; // 'all' | 'pending' | 'complete' | 'blocked' | 'q
 let itemsPage = 1;
 let itemsPageSize = 10;
 var ganttShowCritical = false;
+var ganttZoom = 'week'; // day | week | month
 
 // Derive is_blocked: item has depends_on set AND the parent's status is not 'complete'
 function deriveBlocked(items) {
@@ -2148,7 +2310,8 @@ function itemTrafficDot(item) {
 function renderGanttPage(rawData) {
   var data = deriveBlocked(rawData);
   var ROW_H = 44, PAD = 12, BAR_H = 22, BAR_Y_OFF = (ROW_H - BAR_H) / 2;
-  var AXIS_H = 36, PX_PER_DAY = 20;
+  var AXIS_H = 36;
+  var PX_PER_DAY = ganttZoom === 'day' ? 60 : ganttZoom === 'month' ? 5 : 20;
 
   // Topological sort
   var byId = {};
@@ -2233,14 +2396,23 @@ function renderGanttPage(rawData) {
 
   // Date tick labels
   var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  var tickEvery = totalDays <= 14 ? 1 : totalDays <= 60 ? 7 : 30;
+  var tickEvery = ganttZoom === 'day' ? 1 : ganttZoom === 'month' ? 30 : (totalDays <= 14 ? 1 : totalDays <= 60 ? 7 : 30);
   var ticks = '', td2 = new Date(axisStartMs), dc = 0;
   while (td2.getTime() <= axisEndMs) {
-    if (dc % tickEvery === 0) {
+    var showTick = false;
+    if (ganttZoom === 'month') {
+      showTick = td2.getDate() === 1;
+    } else {
+      showTick = dc % tickEvery === 0;
+    }
+    if (showTick) {
       var tx2 = PAD + dc * PX_PER_DAY;
+      var tickLabel = ganttZoom === 'month'
+        ? MONTHS[td2.getMonth()] + ' ' + td2.getFullYear().toString().slice(2)
+        : MONTHS[td2.getMonth()] + ' ' + td2.getDate();
       ticks += '<line x1="' + tx2 + '" y1="' + AXIS_H + '" x2="' + tx2 + '" y2="' + svgH + '" stroke="#1e2235" stroke-width="1"/>'
         + '<text x="' + tx2 + '" y="' + (AXIS_H - 6) + '" font-size="10" fill="#4b5563" text-anchor="middle" font-family="monospace">'
-        + MONTHS[td2.getMonth()] + ' ' + td2.getDate() + '</text>';
+        + tickLabel + '</text>';
     }
     td2.setDate(td2.getDate() + 1); dc++;
   }
@@ -2393,8 +2565,16 @@ function renderGanttPage(rawData) {
     + '</div>'
     + '</div>';
 
-  var toolbar = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">'
+  var zoomBtnStyle = function(z) {
+    return 'font-size:12px;padding:5px 14px;border-radius:16px;border:1px solid ' + (ganttZoom===z?'#3b82f6':'#2d3148') + ';background:' + (ganttZoom===z?'rgba(59,130,246,0.15)':'transparent') + ';color:' + (ganttZoom===z?'#60a5fa':'#64748b') + ';cursor:pointer';
+  };
+  var toolbar = '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap">'
     + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Gantt &mdash; Dependency View</h2>'
+    + '<div style="display:flex;gap:4px;background:#1a1d27;border:1px solid #2d3148;border-radius:20px;padding:3px">'
+    + '<button onclick="setGanttZoom(\'day\')" style="' + zoomBtnStyle('day') + '">Day</button>'
+    + '<button onclick="setGanttZoom(\'week\')" style="' + zoomBtnStyle('week') + '">Week</button>'
+    + '<button onclick="setGanttZoom(\'month\')" style="' + zoomBtnStyle('month') + '">Month</button>'
+    + '</div>'
     + '<button id="gantt-cp-btn" style="font-size:12px;padding:5px 16px;border-radius:16px;border:1px solid #f59e0b;background:transparent;color:#f59e0b;cursor:pointer">Critical Path</button>'
     + '</div>'
     + '<p style="font-size:13px;color:#64748b;margin:0 0 4px">Items ordered by dependency. Scroll chart right &rarr;. Hover a name to trace connections. Click a name to see full title &amp; description.</p>';
@@ -2558,6 +2738,11 @@ function renderGanttPage(rawData) {
   }, 0);
 }
 
+function setGanttZoom(zoom) {
+  ganttZoom = zoom;
+  if (cache.items) renderGanttPage(cache.items);
+}
+
 function renderItemsPage(rawData) {
   const data = deriveBlocked(rawData);
   const agents = [...new Set(data.map(i => i.agent_assigned).filter(Boolean))].sort();
@@ -2678,6 +2863,43 @@ function updateTabStats(data) {
   });
 }
 
+function buildDepInspector(item, allItems) {
+  // Find what this item depends on (blockers)
+  var blockerHtml = '';
+  if (item.depends_on) {
+    var blocker = allItems.find(function(i) { return i.id === item.depends_on; });
+    blockerHtml = '<div style="margin-bottom:6px">'
+      + '<span style="font-size:11px;color:#64748b">Blocked by:</span> '
+      + (blocker
+        ? '<a href="#" onclick="event.preventDefault();setItemsTab(\'all\');setTimeout(function(){var r=document.querySelector(\'tr[data-expand=\\\'ex-item-'+blocker.id+'\\\'\')\');if(r)r.click()},200)" style="color:#60a5fa;text-decoration:none;font-size:12px">'
+          + '<span class="badge badge-num">#'+blocker.id+'</span> '+esc(blocker.title)+'</a>'
+          + ' <span class="badge '+(blocker.status==='complete'?'badge-complete':blocker.status==='in-progress'?'badge-in-progress':'badge-open')+'">'+esc(blocker.status)+'</span>'
+        : '<span style="color:#64748b;font-size:12px">#'+item.depends_on+' (not loaded)</span>')
+      + '</div>';
+  }
+  // Find tasks that depend on this item (dependents)
+  var dependents = allItems.filter(function(i) { return i.depends_on === item.id; });
+  var dependentsHtml = '';
+  if (dependents.length) {
+    dependentsHtml = '<div>'
+      + '<span style="font-size:11px;color:#64748b">Blocks ' + dependents.length + ' item' + (dependents.length>1?'s':'') + ':</span> '
+      + dependents.map(function(d) {
+          return '<a href="#" onclick="event.preventDefault();setItemsTab(\'all\');setTimeout(function(){var r=document.querySelector(\'tr[data-expand=\\\'ex-item-'+d.id+'\\\'\')\');if(r)r.click()},200)" style="color:#60a5fa;text-decoration:none;font-size:12px">'
+            + '<span class="badge badge-num">#'+d.id+'</span> '+esc(d.title)+'</a>'
+            + ' <span class="badge '+(d.status==='complete'?'badge-complete':d._is_blocked?'badge-blocked':d.status==='in-progress'?'badge-in-progress':'badge-open')+'">'+esc(d.status)+'</span>';
+        }).join('  ')
+      + '</div>';
+  }
+  if (!blockerHtml && !dependentsHtml) return '';
+  return '<div class="expand-field" style="grid-column:1/-1">'
+    + '<label>Dependencies</label>'
+    + '<div style="display:flex;flex-direction:column;gap:6px;font-size:13px">'
+    + blockerHtml
+    + dependentsHtml
+    + '</div>'
+    + '</div>';
+}
+
 function redrawItems() {
   const rawData = cache.items || [];
   const data = deriveBlocked(rawData);
@@ -2763,6 +2985,7 @@ function redrawItems() {
         + (item.remarks ? '<div class="expand-field"><label>Remarks</label><p>'+esc(item.remarks)+'</p></div>' : '')
         + (item.errors_encountered ? '<div class="expand-field errors"><label>Errors</label><p>'+esc(item.errors_encountered)+'</p></div>' : '')
         + (files.length ? '<div class="expand-field"><label>Files Modified</label><p>'+files.map(f=>'<span class="tag">'+esc(f)+'</span>').join(' ')+'</p></div>' : '')
+        + buildDepInspector(item, cache.items || [])
         + '</div></td></tr>' : '');
   }).join('');
 
@@ -2875,6 +3098,232 @@ function renderChainsPage(payload) {
     }).join('')
     + '</tbody></table></div></div>';
   applyDensity('tbl-chains');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAGE: Flow — layered dependency DAG
+// ─────────────────────────────────────────────────────────────────────────────
+function renderFlowPage(rawData) {
+  var data = deriveBlocked(rawData);
+  var byId = {};
+  data.forEach(function(i) { byId[i.id] = i; });
+
+  // Compute topological layers (depth from root)
+  var depth = {};
+  function computeDepth(item) {
+    if (depth[item.id] !== undefined) return depth[item.id];
+    if (!item.depends_on || !byId[item.depends_on]) {
+      depth[item.id] = 0;
+      return 0;
+    }
+    depth[item.id] = computeDepth(byId[item.depends_on]) + 1;
+    return depth[item.id];
+  }
+  data.forEach(function(i) { computeDepth(i); });
+
+  // Group items by layer
+  var layers = {};
+  var maxLayer = 0;
+  data.forEach(function(i) {
+    var d = depth[i.id] || 0;
+    if (!layers[d]) layers[d] = [];
+    layers[d].push(i);
+    if (d > maxLayer) maxLayer = d;
+  });
+
+  // Layout constants
+  var NODE_W = 160, NODE_H = 52, NODE_RX = 8;
+  var COL_GAP = 80, ROW_GAP = 20;
+  var PAD_X = 40, PAD_Y = 40;
+
+  // Compute positions
+  var positions = {};
+  var svgW = 0, svgH = 0;
+  for (var layer = 0; layer <= maxLayer; layer++) {
+    var items = layers[layer] || [];
+    var colX = PAD_X + layer * (NODE_W + COL_GAP);
+    var totalH = items.length * (NODE_H + ROW_GAP) - ROW_GAP;
+    items.forEach(function(item, idx) {
+      var y = PAD_Y + idx * (NODE_H + ROW_GAP);
+      positions[item.id] = { x: colX, y: y, cx: colX + NODE_W / 2, cy: y + NODE_H / 2 };
+      if (colX + NODE_W + PAD_X > svgW) svgW = colX + NODE_W + PAD_X;
+      if (y + NODE_H + PAD_Y > svgH) svgH = y + NODE_H + PAD_Y;
+    });
+  }
+  if (svgW < 400) svgW = 400;
+  if (svgH < 300) svgH = 300;
+
+  // Colour helpers
+  function nodeStroke(item) {
+    if (item._is_blocked) return '#ef4444';
+    if (item.status === 'complete') return '#22c55e';
+    if (item.status === 'in-progress') return '#eab308';
+    if (item.status === 'dropped' || item.status === 'cancelled') return '#4b5563';
+    return '#3b82f6';
+  }
+  function nodeFill(item) {
+    if (item._is_blocked) return 'rgba(239,68,68,0.12)';
+    if (item.status === 'complete') return 'rgba(34,197,94,0.12)';
+    if (item.status === 'in-progress') return 'rgba(234,179,8,0.12)';
+    if (item.status === 'dropped' || item.status === 'cancelled') return 'rgba(75,85,99,0.12)';
+    return 'rgba(30,34,51,0.9)';
+  }
+
+  // Draw edges (dependency arrows)
+  var arrows = data.filter(function(item) {
+    return item.depends_on && positions[item.depends_on] && positions[item.id];
+  }).map(function(item) {
+    var from = positions[item.depends_on];
+    var to = positions[item.id];
+    // from right edge of blocker, to left edge of dependent
+    var x1 = from.x + NODE_W;
+    var y1 = from.cy;
+    var x2 = to.x;
+    var y2 = to.cy;
+    var mx = (x1 + x2) / 2;
+    var col = item._is_blocked ? '#ef4444' : '#374151';
+    var dash = item._is_blocked ? '4,3' : 'none';
+    return '<path class="flow-arrow" data-from="' + item.depends_on + '" data-to="' + item.id + '"'
+      + ' d="M' + x1 + ',' + y1 + ' C' + mx + ',' + y1 + ' ' + mx + ',' + y2 + ' ' + x2 + ',' + y2 + '"'
+      + ' fill="none" stroke="' + col + '" stroke-width="1.5" stroke-dasharray="' + dash + '" opacity="0.4"'
+      + ' marker-end="url(#flow-arr-' + (item._is_blocked?'red':'gray') + ')"/>';
+  }).join('');
+
+  // Draw nodes
+  var nodes = data.map(function(item) {
+    var pos = positions[item.id];
+    if (!pos) return '';
+    var stroke = nodeStroke(item);
+    var fill = nodeFill(item);
+    var titleText = item.title.length > 18 ? item.title.slice(0,18) + '…' : item.title;
+    var statusText = item.status;
+    if (item._is_blocked) statusText = 'blocked';
+    return '<g class="flow-node" data-id="' + item.id + '" data-status="' + esc(item.status) + '" data-title="' + esc(item.title) + '"'
+      + ' style="cursor:pointer" transform="translate(' + pos.x + ',' + pos.y + ')">'
+      + '<rect x="0" y="0" width="' + NODE_W + '" height="' + NODE_H + '" rx="' + NODE_RX + '"'
+      + ' fill="' + fill + '" stroke="' + stroke + '" stroke-width="1.5" class="flow-node-rect"/>'
+      + '<text x="' + (NODE_W/2) + '" y="18" font-size="11" fill="#e2e8f0" text-anchor="middle" font-family="sans-serif" font-weight="600">#' + item.id + '</text>'
+      + '<text x="' + (NODE_W/2) + '" y="32" font-size="10" fill="#94a3b8" text-anchor="middle" font-family="sans-serif">' + esc(titleText) + '</text>'
+      + '<text x="' + (NODE_W/2) + '" y="46" font-size="9" fill="' + stroke + '" text-anchor="middle" font-family="monospace">' + esc(statusText) + '</text>'
+      + '<title>' + esc(item.title) + ' | ' + esc(item.status) + (item.priority?' | '+item.priority:'') + '</title>'
+      + '</g>';
+  }).join('');
+
+  // Layer headers
+  var layerLabels = '';
+  for (var l = 0; l <= maxLayer; l++) {
+    var lx = PAD_X + l * (NODE_W + COL_GAP) + NODE_W / 2;
+    layerLabels += '<text x="' + lx + '" y="18" font-size="10" fill="#4b5563" text-anchor="middle" font-family="monospace" font-weight="700">Layer ' + l + '</text>';
+  }
+
+  var svg = '<svg id="flow-svg" width="' + svgW + '" height="' + svgH + '" xmlns="http://www.w3.org/2000/svg" style="display:block;min-width:' + svgW + 'px">'
+    + '<defs>'
+    + '<marker id="flow-arr-gray" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#374151"/></marker>'
+    + '<marker id="flow-arr-red"  markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#ef4444"/></marker>'
+    + '<marker id="flow-arr-hl"   markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L8,3 z" fill="#818cf8"/></marker>'
+    + '</defs>'
+    + '<rect width="' + svgW + '" height="' + svgH + '" fill="#0a0c14"/>'
+    + layerLabels
+    + arrows + nodes
+    + '</svg>';
+
+  // Detail panel HTML (shows on click)
+  var detailPanel = '<div id="flow-detail" style="display:none;position:fixed;right:24px;top:80px;width:300px;background:#1a1d27;border:1px solid #334155;border-radius:10px;padding:16px;z-index:500;box-shadow:0 8px 32px rgba(0,0,0,0.7)">'
+    + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">'
+    + '<span style="font-size:14px;font-weight:700;color:#e2e8f0;flex:1" id="flow-detail-title">—</span>'
+    + '<button onclick="document.getElementById(\'flow-detail\').style.display=\'none\'" style="background:transparent;border:none;color:#64748b;cursor:pointer;font-size:16px;padding:0 4px">x</button>'
+    + '</div>'
+    + '<div id="flow-detail-body" style="font-size:13px;color:#94a3b8;line-height:1.6"></div>'
+    + '</div>';
+
+  $('pageContent').innerHTML =
+    '<div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">'
+    + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Flow &mdash; Dependency DAG</h2>'
+    + '<span style="font-size:13px;color:#64748b">' + data.length + ' nodes &middot; Layered by dependency depth &middot; Click a node to inspect</span>'
+    + '</div>'
+    + '<div style="background:#1a1d27;border:1px solid #1e2235;border-radius:8px;overflow-x:auto;padding:8px">'
+    + svg + '</div>'
+    + detailPanel;
+
+  // Interactivity
+  setTimeout(function() {
+    var flowSvg = document.getElementById('flow-svg');
+    if (!flowSvg) return;
+
+    function allArrows() { return flowSvg.querySelectorAll('.flow-arrow'); }
+    function allNodes() { return flowSvg.querySelectorAll('.flow-node'); }
+
+    function resetHighlight() {
+      allArrows().forEach(function(el) {
+        el.setAttribute('opacity', '0.4');
+        el.setAttribute('stroke-width', '1.5');
+        var isBlocked = el.getAttribute('stroke') === '#ef4444';
+        el.setAttribute('marker-end', 'url(#flow-arr-' + (isBlocked?'red':'gray') + ')');
+      });
+      allNodes().forEach(function(g) {
+        g.querySelector('.flow-node-rect').setAttribute('opacity', '1');
+      });
+    }
+
+    // Hover highlight
+    allNodes().forEach(function(g) {
+      var nodeId = g.getAttribute('data-id');
+      g.addEventListener('mouseenter', function() {
+        allArrows().forEach(function(el) {
+          var from = el.getAttribute('data-from');
+          var to = el.getAttribute('data-to');
+          if (String(from) === nodeId || String(to) === nodeId) {
+            el.setAttribute('opacity', '1');
+            el.setAttribute('stroke-width', '2.5');
+            el.setAttribute('stroke', '#818cf8');
+            el.setAttribute('marker-end', 'url(#flow-arr-hl)');
+          } else {
+            el.setAttribute('opacity', '0.08');
+          }
+        });
+        allNodes().forEach(function(gn) {
+          if (gn !== g) gn.querySelector('.flow-node-rect').setAttribute('opacity', '0.3');
+        });
+      });
+      g.addEventListener('mouseleave', function() {
+        resetHighlight();
+      });
+
+      // Click: show detail panel
+      g.addEventListener('click', function() {
+        var item = (cache.items||[]).find(function(i) { return String(i.id) === nodeId; });
+        if (!item) return;
+        var panel = document.getElementById('flow-detail');
+        var titleEl = document.getElementById('flow-detail-title');
+        var bodyEl = document.getElementById('flow-detail-body');
+        if (!panel || !titleEl || !bodyEl) return;
+        titleEl.textContent = '#' + item.id + ' ' + item.title;
+        var depItem = item.depends_on && (cache.items||[]).find(function(i) { return i.id === item.depends_on; });
+        var depText = item.depends_on
+          ? (depItem ? 'Blocked by #' + depItem.id + ' ' + depItem.title : 'Blocked by #' + item.depends_on)
+          : 'No blocker';
+        var depItems = (cache.items||[]).filter(function(i) { return i.depends_on === item.id; });
+        bodyEl.innerHTML =
+          '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px">STATUS</span><br>'
+          + '<span class="badge ' + (item.status==='complete'?'badge-complete':item._is_blocked?'badge-blocked':item.status==='in-progress'?'badge-in-progress':'badge-open') + '">' + esc(item._is_blocked?'blocked':item.status) + '</span>'
+          + ' <span class="badge ' + (item.priority==='critical'?'badge-critical':item.priority==='high'?'badge-high':item.priority==='medium'?'badge-medium':'badge-low') + '">' + esc(item.priority||'—') + '</span>'
+          + '</div>'
+          + (item.plan_description ? '<div style="margin-bottom:8px"><span style="color:#64748b;font-size:11px">REQUIRED</span><br><span style="font-size:12px">' + esc(item.plan_description.slice(0,200)) + (item.plan_description.length>200?'…':'') + '</span></div>' : '')
+          + '<div style="margin-bottom:6px"><span style="color:#64748b;font-size:11px">DEPENDS ON</span><br><span style="font-size:12px">' + esc(depText) + '</span></div>'
+          + (depItems.length ? '<div><span style="color:#64748b;font-size:11px">BLOCKS</span><br>' + depItems.map(function(d) { return '<span class="badge badge-num">#'+d.id+'</span> '+esc(d.title.slice(0,30)); }).join('<br>') + '</div>' : '');
+        panel.style.display = 'block';
+      });
+    });
+
+    // Click outside to close detail
+    document.addEventListener('click', function(e) {
+      var panel = document.getElementById('flow-detail');
+      var svg = document.getElementById('flow-svg');
+      if (panel && !panel.contains(e.target) && !(svg && svg.contains(e.target))) {
+        panel.style.display = 'none';
+      }
+    });
+  }, 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3174,12 +3623,140 @@ function redrawFC() {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PAGE: Activities
+// ─────────────────────────────────────────────────────────────────────────────
+let actFilter = { search:'', status:'', type:'', agent:'' };
+let actPage = 1;
+let actPageSize = 10;
+
+function renderActivitiesPage(data) {
+  const agents = [...new Set(data.map(a => a.agent).filter(Boolean))].sort();
+  const agentOpts = '<option value="">All agents</option>' + agents.map(a=>'<option value="'+esc(a)+'">'+esc(a)+'</option>').join('');
+  const types = ['delegation_out','delegation_return','direct_action','verification','file_edit','bash_command','decision','error','slash_command'];
+  const typeOpts = '<option value="">All types</option>' + types.map(t=>'<option value="'+t+'">'+t.replace(/_/g,' ').toUpperCase()+'</option>').join('');
+  const statuses = ['running','success','partial','failed','cancelled'];
+  const statusOpts = '<option value="">All statuses</option>' + statuses.map(s=>'<option value="'+s+'">'+s.toUpperCase()+'</option>').join('');
+
+  // Calculate summary stats
+  const total = data.length;
+  const successCount = data.filter(a => a.status === 'success').length;
+  const successRate = total > 0 ? Math.round((successCount / total) * 100) : 0;
+  const sevenDaysAgo = Date.now() - 7 * 86400 * 1000;
+  const recentCount = data.filter(a => {
+    if (!a.created_at) return false;
+    const dt = parseDbDate(a.created_at);
+    return dt && dt.getTime() >= sevenDaysAgo;
+  }).length;
+
+  $('pageContent').innerHTML = '<div class="section"><div class="section-header"><div class="section-title">Activity Summary</div></div>'
+    + '<div class="perf-chips" style="margin-bottom:16px">'
+    + '<div class="perf-chip default"><span class="chip-val">'+total+'</span><span class="chip-lbl">Total</span></div>'
+    + '<div class="perf-chip green"><span class="chip-val">'+successRate+'%</span><span class="chip-lbl">Success Rate</span></div>'
+    + '<div class="perf-chip blue"><span class="chip-val">'+recentCount+'</span><span class="chip-lbl">Last 7 Days</span></div>'
+    + '</div></div>'
+    + '<div class="filter-bar">'
+    + '<div class="filter-group"><label>Search</label><input type="text" placeholder="Summary…" value="'+esc(actFilter.search)+'" oninput="actFilter.search=this.value;actPage=1;redrawActivities()"></div>'
+    + '<div class="filter-group"><label>Type</label><select onchange="actFilter.type=this.value;actPage=1;redrawActivities()">'+typeOpts+'</select></div>'
+    + '<div class="filter-group"><label>Status</label><select onchange="actFilter.status=this.value;actPage=1;redrawActivities()">'+statusOpts+'</select></div>'
+    + '<div class="filter-group"><label>Agent</label><select onchange="actFilter.agent=this.value;actPage=1;redrawActivities()">'+agentOpts+'</select></div>'
+    + '<button class="clear-btn" onclick="actFilter={search:\\'\\',status:\\'\\',type:\\'\\',agent:\\'\\'};actPage=1;renderActivitiesPage(cache.activities||[])">Clear</button>'
+    + '</div>'
+    + '<div class="result-count" id="act-count"></div>'
+    + '<div class="table-wrap">'
+    + '<div class="table-toolbar">' + makeDensityBtn('tbl-act') + '</div>'
+    + '<div class="table-scroll"><table id="tbl-act">'
+    + '<thead><tr>'
+    + '<th data-col="id">ID</th><th data-col="created_at">Time</th><th data-col="agent">Agent</th><th data-col="activity_type">Type</th>'
+    + '<th data-col="task_summary">Summary</th><th data-col="status">Status</th><th data-col="pdca_item_id">PDCA Link</th>'
+    + '</tr></thead><tbody id="act-tbody"></tbody></table></div>'
+    + '<div class="pagination-bar" id="act-pgbar"></div>'
+    + '</div>';
+
+  attachSortHeaders('tbl-act', 'activities', function() { actPage=1; redrawActivities(); });
+  applyDensity('tbl-act');
+  redrawActivities();
+}
+
+function activityStatusBadge(s) {
+  const m = { success:'badge-complete', failed:'badge-fail', running:'badge-in-progress', partial:'badge-partial', cancelled:'badge-cancelled' };
+  return '<span class="badge ' + (m[s]||'badge-open') + '">' + esc(s||'—') + '</span>';
+}
+
+function activityTypeBadge(t) {
+  const colors = {
+    delegation_out: 'badge-queued',
+    delegation_return: 'badge-complete',
+    direct_action: 'badge-do',
+    verification: 'badge-check',
+    file_edit: 'badge-plan',
+    bash_command: 'badge-act',
+    decision: 'badge-medium',
+    error: 'badge-fail',
+    slash_command: 'badge-low'
+  };
+  return '<span class="badge ' + (colors[t]||'badge-low') + '">' + esc(t||'—').replace(/_/g,' ').toUpperCase() + '</span>';
+}
+
+function redrawActivities() {
+  const data = cache.activities || [];
+  const f = actFilter;
+  const st = sortState['activities'] || {};
+  let filtered = data.filter(a => {
+    if (f.search && !String(a.task_summary||'').toLowerCase().includes(f.search.toLowerCase())) return false;
+    if (f.status && a.status !== f.status) return false;
+    if (f.type && a.activity_type !== f.type) return false;
+    if (f.agent && a.agent !== f.agent) return false;
+    return true;
+  });
+  filtered = sortData(filtered, st.col, st.dir);
+  applyThSortClasses('tbl-act', 'activities');
+
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / actPageSize));
+  if (actPage > totalPages) actPage = totalPages;
+  const start = (actPage - 1) * actPageSize;
+  const pageSlice = filtered.slice(start, start + actPageSize);
+
+  const countEl = document.getElementById('act-count');
+  if (countEl) countEl.textContent = 'Showing ' + (total===0?0:start+1) + '–' + Math.min(start+actPageSize,total) + ' of ' + total + ' results';
+
+  const tbody = document.getElementById('act-tbody');
+  if (!tbody) return;
+  tbody.innerHTML = pageSlice.map(a => {
+    const eid = 'ex-act-' + a.id;
+    const hasDetail = a.detail || a.files_modified;
+    const files = parseArr(a.files_modified);
+    const pdcaLink = a.pdca_item_id ? '<a href="#" onclick="navigateTo(\\'items\\');setTimeout(function(){window.location.hash=\\'item-'+a.pdca_item_id+'\\'},100);return false;" class="badge badge-num">#'+a.pdca_item_id+'</a>' : '—';
+    return '<tr class="'+(hasDetail?'clickable-row':'')+'" '+(hasDetail?'data-expand="'+eid+'"':'')+' title="'+(hasDetail?'Click to expand':'')+'">'
+      + '<td class="mono">#'+a.id+'</td>'
+      + '<td class="dim">' + timeAgoCell(a.created_at) + '</td>'
+      + '<td class="dim">'+fmt(a.agent)+'</td>'
+      + '<td>'+activityTypeBadge(a.activity_type)+'</td>'
+      + '<td style="max-width:320px"><span title="'+esc(a.task_summary||'')+'">'+esc(trunc(a.task_summary||'—', 80))+'</span></td>'
+      + '<td>'+activityStatusBadge(a.status)+'</td>'
+      + '<td>'+pdcaLink+'</td>'
+      + '</tr>'
+      + (hasDetail ? '<tr class="expand-row" id="'+eid+'"><td colspan="7"><div class="expand-grid">'
+        + (a.detail ? '<div class="expand-field"><label>Detail</label><p>'+esc(a.detail)+'</p></div>' : '')
+        + (files.length ? '<div class="expand-field"><label>Files Modified</label><p>'+files.map(f=>'<span class="tag">'+esc(f)+'</span>').join(' ')+'</p></div>' : '')
+        + (a.model ? '<div class="expand-field"><label>Model</label><p>'+esc(a.model)+'</p></div>' : '')
+        + (a.duration_secs ? '<div class="expand-field"><label>Duration</label><p>'+a.duration_secs+'s</p></div>' : '')
+        + '</div></td></tr>' : '');
+  }).join('');
+  attachExpand(document.getElementById('tbl-act'));
+  renderPagination('act-pgbar', actPage, totalPages, total, actPageSize, start,
+    function(pg) { actPage = pg; redrawActivities(); },
+    function(sz) { actPageSize = sz; actPage = 1; redrawActivities(); }
+  );
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 // Restore page from URL on load / refresh
 try {
   (function initFromUrl() {
-    var VALID_PAGES = ['overview', 'items', 'gantt', 'chains', 'sessions', 'cycles', 'file-changes'];
+    var VALID_PAGES = ['overview', 'items', 'gantt', 'chains', 'flow', 'sessions', 'cycles', 'file-changes', 'activities'];
     var rawPath = window.location.pathname.slice(1) || 'overview';
     var page = VALID_PAGES.indexOf(rawPath) !== -1 ? rawPath : 'overview';
     currentPage = page;
