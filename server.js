@@ -11,7 +11,9 @@ const DB_PATH = '/root/data/assistant/tasks.db';
 // Credentials: env-var with fallback to existing hash so a bad env doesn't lock anyone out.
 // Rotate via PDCA_AUTH_USER / PDCA_AUTH_HASH without editing source.
 const AUTH_USER = process.env.PDCA_AUTH_USER || 'ashish@konzult.in';
-const AUTH_HASH = process.env.PDCA_AUTH_HASH || '$2b$14$N0/MVQbizO9uAx/6AP6dWO6EKsRTMixRdQjo/Kc/TMg2wXHwdyKXC';
+// Fallback matches the code.konzult.in basic_auth hash — same password as your code-server.
+// Set PDCA_AUTH_HASH env var to override without editing source (rotate without a source change).
+const AUTH_HASH = process.env.PDCA_AUTH_HASH || '$2a$14$WDKpUrU7Xiu.QWRb4ZFq5.OQjIGCu6HmAl8pBP3Zu9AKhoXrniNsS';
 
 let db;
 
@@ -2591,9 +2593,6 @@ function deriveBlocked(items) {
     return !isAnyAncestorIncomplete(item);
   }
 
-  return items.map(i => {
-    const blocked = isAnyAncestorIncomplete(i) || i.status === 'blocked';
-    const locked = isLocked(i);
   // Build child map for blocks_count computation
   const childCountMap = {};
   items.forEach(i => {
