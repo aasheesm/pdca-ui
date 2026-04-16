@@ -4310,6 +4310,9 @@ app.get('*', (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`PDCA Dashboard running at http://0.0.0.0:${PORT}`);
+// Bind to localhost — pdca.konzult.in via Caddy is the only public ingress.
+// Override with LISTEN_HOST=0.0.0.0 only if you deliberately need direct access.
+const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
+app.listen(PORT, LISTEN_HOST, () => {
+  console.log(`PDCA Dashboard running at http://${LISTEN_HOST}:${PORT}`);
 });
