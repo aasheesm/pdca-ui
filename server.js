@@ -96,6 +96,9 @@ app.use(session({
 function requireAuth(req, res, next) {
   if (req.session && req.session.authenticated) return next();
   if (req.path === '/login') return next();
+  // Allow internal localhost API calls (auto-queue from queue processor)
+  if (req.path.match(/\/api\/items\/\d+\/auto-queue-dependents$/) && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
+  if (req.path === '/api/batch-unlock' && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not authenticated' });
   res.redirect('/login');
 }
@@ -169,7 +172,7 @@ app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
 
     if (existing) {
       // Update existing item with new occurrence info
-      db.prepare("UPDATE pdca_items SET actual_description = ?, updated_at = datetime('now','localtime') WHERE id = ?")
+      db.prepare("UPDATE pdca_items SET actual_description = ? WHERE id = ?")
         .run(actualDesc, existing.id);
       db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))")
         .run(existing.id, '[GlitchTip] Recurring error: +1 occurrence | Total: ' + eventCount + ' | Users: ' + userCount);
@@ -574,22 +577,12 @@ app.post('/api/items/:id/queue', (req, res) => {
 });
 
 // ── Auto-queue unlocked items when a dependency completes ────────────────────
-// When item X completes, find all items that depend_on X (directly or transitively).
-// For each such item, if ALL its ancestors are now complete/cancelled/dropped,
-// auto-queue it. This is the "chain reaction" that unlocks the next layer.
+// BFS through descendants: find all items that depend (transitively) on the completed item.
+// For each such item that is in 'open' status and has ALL ancestors complete, auto-queue it.
 function autoQueueUnlockedItems(completedItemId) {
   const completed = db.prepare('SELECT id, project_id FROM pdca_items WHERE id = ?').get(completedItemId);
   if (!completed) return [];
 
-  // Find all items in the same project that depend on the completed item (directly)
-  const directDependents = db.prepare(
-    "SELECT id, depends_on FROM pdca_items WHERE project_id = ? AND depends_on = ? AND status = 'open'"
-  ).all(completed.project_id, completedItemId);
-
-  const autoQueued = [];
-
-  // Also check items that depend on items that depend on the completed item (transitive)
-  // Use BFS to walk the descendant chain
   const allProjectItems = db.prepare('SELECT id, title, status, depends_on, agent_assigned FROM pdca_items WHERE project_id = ?').all(completed.project_id);
   const itemById = {};
   allProjectItems.forEach(i => { itemById[i.id] = i; });
@@ -611,30 +604,28 @@ function autoQueueUnlockedItems(completedItemId) {
     if (visited.has(parentId)) continue;
     visited.add(parentId);
     const children = childMap[parentId] || [];
-    children.forEach(child => {
-      queue.push(child.id);
-    });
+    children.forEach(child => { queue.push(child.id); });
   }
 
-  // For each descendant that is in 'open' status, check if all its ancestors are now complete
+  const autoQueued = [];
+
+  // For each descendant in 'open' status, check if all ancestors are now complete
   allProjectItems.forEach(item => {
     if (item.status !== 'open') return;
-    if (!visited.has(item.id) && item.id !== completedItemId) return; // not a descendant
+    if (!visited.has(item.id)) return; // not a descendant
+    if (!item.depends_on) return; // root item — don't auto-queue
 
     const ancestors = getAncestorChain(itemById, item.id);
     const incompleteAncestors = ancestors.filter(a => a.id !== item.id && a.status !== 'complete' && a.status !== 'cancelled' && a.status !== 'dropped');
 
     if (incompleteAncestors.length === 0) {
-      // All ancestors complete! Auto-queue this item.
       try {
         db.prepare("UPDATE pdca_items SET status='queued', started_at=datetime('now', 'localtime') WHERE id=?").run(item.id);
-        autoQueued.push({ id: item.id, title: item.title });
-
-        // Log the auto-queue event
         db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))").run(
           item.id,
           '[Auto-Queue] All dependencies now complete (ancestor #' + completedItemId + ' completed). Auto-queued.'
         );
+        autoQueued.push({ id: item.id, title: item.title });
       } catch (e) {
         console.error('[Auto-Queue] Failed to auto-queue #' + item.id + ':', e.message);
       }
@@ -644,9 +635,7 @@ function autoQueueUnlockedItems(completedItemId) {
   // Kick the queue processor if we auto-queued anything
   if (autoQueued.length > 0) {
     const { spawn } = require('child_process');
-    spawn('/root/scripts/pdca-queue-processor.sh', [], {
-      detached: true, stdio: 'ignore'
-    }).unref();
+    spawn('/root/scripts/pdca-queue-processor.sh', [], { detached: true, stdio: 'ignore' }).unref();
   }
 
   return autoQueued;
@@ -660,12 +649,7 @@ app.post('/api/items/:id/complete', (req, res) => {
     const row = db.prepare('SELECT id, status, project_id FROM pdca_items WHERE id = ?').get(id);
     if (!row) return res.status(404).json({ error: 'Item not found' });
 
-    // Update status to complete
-    const updates = [
-      "status='complete'",
-      "completed_at=datetime('now', 'localtime')",
-      "chain_status='complete'"
-    ];
+    const updates = ["status='complete'", "completed_at=datetime('now', 'localtime')", "chain_status='complete'"];
     if (actual_description) updates.push("actual_description='" + String(actual_description).replace(/'/g, "''") + "'");
     if (check_verdict) updates.push("check_verdict='" + String(check_verdict).replace(/'/g, "''") + "'");
 
@@ -674,17 +658,23 @@ app.post('/api/items/:id/complete', (req, res) => {
     // Auto-queue any items that were blocked by this one and are now unblocked
     const autoQueued = autoQueueUnlockedItems(id);
 
-    // Log completion
     db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))").run(
       id,
       '[Complete] Item marked complete.' + (autoQueued.length > 0 ? ' Auto-queued ' + autoQueued.length + ' dependent item(s): ' + autoQueued.map(a => '#' + a.id).join(', ') : '')
     );
 
-    res.json({
-      ok: true,
-      message: 'Item #' + id + ' marked complete.',
-      auto_queued: autoQueued
-    });
+    res.json({ ok: true, message: 'Item #' + id + ' marked complete.', auto_queued: autoQueued });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Auto-queue dependents after completion (internal, called by queue processor) ──
+app.post('/api/items/:id/auto-queue-dependents', (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const autoQueued = autoQueueUnlockedItems(id);
+    res.json({ ok: true, auto_queued: autoQueued });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -696,19 +686,18 @@ app.post('/api/batch-unlock', (req, res) => {
     const { project } = req.body || {};
     if (!project) return res.status(400).json({ error: 'project param required' });
 
-    const items = db.prepare('SELECT id, title, status, depends_on FROM pdca_items WHERE project_id = ? AND status = \'open\'').all(project);
+    const items = db.prepare("SELECT id, title, status, depends_on FROM pdca_items WHERE project_id = ? AND status = 'open'").all(project);
     const itemById = {};
     items.forEach(i => { itemById[i.id] = i; });
 
     const unlocked = [];
 
     items.forEach(item => {
-      if (!item.depends_on) return; // root items — don't auto-queue these, they need manual start
+      if (!item.depends_on) return; // root items — don't auto-queue
       const ancestors = getAncestorChain(itemById, item.id);
       const incompleteAncestors = ancestors.filter(a => a.id !== item.id && a.status !== 'complete' && a.status !== 'cancelled' && a.status !== 'dropped');
 
       if (incompleteAncestors.length === 0) {
-        // All ancestors complete — auto-queue this item
         db.prepare("UPDATE pdca_items SET status='queued', started_at=datetime('now', 'localtime') WHERE id=?").run(item.id);
         db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))").run(
           item.id,
@@ -718,12 +707,9 @@ app.post('/api/batch-unlock', (req, res) => {
       }
     });
 
-    // Kick the queue processor
     if (unlocked.length > 0) {
       const { spawn } = require('child_process');
-      spawn('/root/scripts/pdca-queue-processor.sh', [], {
-        detached: true, stdio: 'ignore'
-      }).unref();
+      spawn('/root/scripts/pdca-queue-processor.sh', [], { detached: true, stdio: 'ignore' }).unref();
     }
 
     res.json({ ok: true, unlocked_count: unlocked.length, unlocked: unlocked });
@@ -2569,7 +2555,7 @@ function deriveBlocked(items) {
     return isAnyAncestorIncomplete(item);
   }
 
-  // Check if an item is "ready" (all ancestors complete, can be started now)
+  // Check if an item is "ready" (all ancestors complete, open status, can be started now)
   function isReady(item) {
     if (item.status === 'complete' || item.status === 'cancelled' || item.status === 'dropped') return false;
     if (item.status === 'in-progress') return false;
@@ -2585,7 +2571,7 @@ function deriveBlocked(items) {
 }
 
 function itemTrafficDot(item) {
-  if (item._is_locked) return '<span class="tl-dot tl-red" title="Locked — waiting on incomplete dependency (cannot start)">🔒</span>';
+  if (item._is_locked) return '<span class="tl-dot" style="color:#ef4444" title="Locked — waiting on incomplete dependency (cannot start)">🔒</span>';
   if (item._is_blocked || item.status === 'blocked') return '<span class="tl-dot tl-red" title="Blocked — waiting on dependency">●</span>';
   if (item.status === 'complete') return '<span class="tl-dot tl-green" title="Complete">●</span>';
   if (item.status === 'queued') return '<span class="tl-dot tl-purple" title="Queued — dispatched, waiting for LLM pickup">●</span>';
@@ -3549,22 +3535,10 @@ function renderFlowPage(rawData) {
     + '<div id="flow-detail-body" style="font-size:13px;color:#94a3b8;line-height:1.6"></div>'
     + '</div>';
 
-  // Count ready/blocked/complete
-  var readyCount = data.filter(function(i) { return i._is_ready; }).length;
-  var blockedCount = data.filter(function(i) { return i._is_blocked && i.status !== 'complete'; }).length;
-  var completeCount = data.filter(function(i) { return i.status === 'complete'; }).length;
-
   $('pageContent').innerHTML =
     '<div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">'
     + '<h2 style="font-size:18px;font-weight:600;margin:0;flex:1">Flow &mdash; Dependency DAG</h2>'
-    + '<span style="font-size:13px;color:#64748b">' + data.length + ' nodes &middot; Layered by dependency depth &middot; Hover to trace chain &middot; Click for full detail</span>'
-    + '</div>'
-    + '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:12px">'
-    + '<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:50%;background:#22c55e;display:inline-block"></span> Ready (' + readyCount + ')</span>'
-    + '<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:50%;background:#ef4444;display:inline-block"></span> Blocked (' + blockedCount + ')</span>'
-    + '<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:50%;background:#3b82f6;display:inline-block"></span> Open/Queued</span>'
-    + '<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:50%;background:#22c55e;opacity:0.5;display:inline-block"></span> Complete (' + completeCount + ')</span>'
-    + '<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:50%;background:#4b5563;display:inline-block"></span> Dropped</span>'
+    + '<span style="font-size:13px;color:#64748b">' + data.length + ' nodes &middot; Layered by dependency depth &middot; Hover to trace chain &middot; Click for full dependency detail</span>'
     + '</div>'
     + '<div style="background:#1a1d27;border:1px solid #1e2235;border-radius:8px;overflow-x:auto;padding:8px">'
     + svg + '</div>'
