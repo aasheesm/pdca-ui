@@ -5,6 +5,89 @@ const Database = require('better-sqlite3');
 const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
+const https = require('https');
+const http = require('http');
+const { execFile } = require('child_process');
+
+// ── Telegram notifier ─────────────────────────────────────────────────────────
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8661099102:AAGEoNeWRtwLILuxPzbjj-sJe1A1CdHj6O4';
+const TG_CHAT  = process.env.TELEGRAM_CHAT_ID   || '6797237984';
+
+function sendTelegram(text) {
+  const body = JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: 'Markdown' });
+  const opts = {
+    hostname: 'api.telegram.org',
+    path: `/bot${TG_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  };
+  const req = https.request(opts, r => r.resume());
+  req.on('error', e => console.error('[Telegram]', e.message));
+  req.write(body);
+  req.end();
+}
+
+// ── GlitchTip issue resolver ──────────────────────────────────────────────────
+const GLITCHTIP_TOKEN = process.env.GLITCHTIP_TOKEN || '';
+const GLITCHTIP_HOST  = 'glitchtip.konzult.in';
+
+function resolveGlitchTipIssue(issueId) {
+  if (!GLITCHTIP_TOKEN || !issueId) return;
+  const body = JSON.stringify({ status: 'resolved' });
+  const opts = {
+    hostname: GLITCHTIP_HOST,
+    path: `/api/0/issues/${issueId}/`,
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'Authorization': `Bearer ${GLITCHTIP_TOKEN}`
+    }
+  };
+  const req = https.request(opts, r => {
+    r.resume();
+    console.log(`[GlitchTip] Issue ${issueId} resolved — HTTP ${r.statusCode}`);
+  });
+  req.on('error', e => console.error('[GlitchTip resolve]', e.message));
+  req.write(body);
+  req.end();
+}
+
+// ── Auto-fix agent trigger ────────────────────────────────────────────────────
+function triggerAutoFixAgent(itemId, title, description) {
+  const prompt = [
+    `GlitchTip auto-fix task — PDCA item #${itemId}`,
+    `Title: ${title}`,
+    ``,
+    `${description}`,
+    ``,
+    `Instructions:`,
+    `1. Read the error details above and find the root cause in the WorkBuddy backend codebase at /root/projects/workbuddy/`,
+    `2. Fix the bug`,
+    `3. Run the relevant tests to confirm the fix`,
+    `4. Call POST https://pdca.konzult.in/api/items/${itemId}/complete with actual_description summarising what you found and fixed`,
+    `5. Do NOT push to git — just fix locally and report back`,
+  ].join('\n');
+
+  // Spawn Claude Code workbuddy-agent non-interactively
+  execFile('claude', [
+    '--agent', 'workbuddy-agent',
+    '--permission-mode', 'auto',
+    '--no-stream',
+    '-p', prompt
+  ], {
+    cwd: '/root/projects/workbuddy',
+    timeout: 10 * 60 * 1000, // 10 min max
+    env: { ...process.env }
+  }, (err, stdout, stderr) => {
+    if (err) {
+      console.error(`[AutoFix] Agent error for #${itemId}:`, err.message);
+      sendTelegram(`⚠️ *Auto-fix agent failed* for PDCA #${itemId}\n\`${err.message}\`\n\nPlease fix manually: https://pdca.konzult.in`);
+      return;
+    }
+    console.log(`[AutoFix] Agent completed for #${itemId}`);
+  });
+}
 
 const PORT = Number(process.env.PORT) || 7010;
 const DB_PATH = '/root/data/assistant/tasks.db';
@@ -133,6 +216,7 @@ function requireAuth(req, res, next) {
   // Allow internal localhost API calls (auto-queue from queue processor)
   if (req.path.match(/\/api\/items\/\d+\/auto-queue-dependents$/) && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
   if (req.path === '/api/batch-unlock' && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
+  if (req.path.match(/\/api\/items\/\d+\/complete$/) && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) return next();
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Not authenticated' });
   // Clear the stale cookie on redirect so the browser doesn't keep sending a dead session id.
   res.clearCookie('pdca_sid', { path: '/' });
@@ -201,17 +285,21 @@ app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
 
     const actualDesc = 'Auto-created from GlitchTip alert. ' + eventCount + ' occurrence(s) from ' + environment + '. ' + userCount + ' user(s) affected.';
 
+    // Store GlitchTip issue ID for two-way sync (resolve on complete)
+    const glitchtipIssueId = issue.id || data.id || null;
+    const gtIdTag = glitchtipIssueId ? `\nglitchtip_issue_id: ${glitchtipIssueId}` : '';
+
     // Avoid duplicates: check if similar open issue exists
     const existing = db.prepare(
-      "SELECT id, status FROM pdca_items WHERE project_id = ? AND title LIKE ? AND status IN ('open','in-progress','queued') ORDER BY id DESC LIMIT 1"
+      "SELECT id, status, remarks FROM pdca_items WHERE project_id = ? AND title LIKE ? AND status IN ('open','in-progress','queued') ORDER BY id DESC LIMIT 1"
     ).get(pdcaProjectId, '%' + issueTitle.slice(0, 50) + '%');
 
     if (existing) {
-      // Update existing item with new occurrence info
       db.prepare("UPDATE pdca_items SET actual_description = ? WHERE id = ?")
         .run(actualDesc, existing.id);
       db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))")
         .run(existing.id, '[GlitchTip] Recurring error: +1 occurrence | Total: ' + eventCount + ' | Users: ' + userCount);
+      sendTelegram(`🔁 *Recurring error* — PDCA #${existing.id}\n*${issueTitle}*\nOccurrences: ${eventCount} | Users: ${userCount}\nhttps://pdca.konzult.in`);
       return res.json({ ok: true, action: 'updated', id: existing.id });
     }
 
@@ -219,31 +307,47 @@ app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
     const result = db.prepare(`
       INSERT INTO pdca_items (
         project_id, slug, title, phase, status, priority, category,
-        plan_description, actual_description, agent_assigned,
+        plan_description, actual_description, agent_assigned, remarks,
         created_at, started_at, hypothesis, acceptance_criteria
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'), ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'), datetime('now','localtime'), ?, ?)
     `).run(
       pdcaProjectId,
       slug,
       '[GlitchTip] ' + issueTitle,
-      'plan',
-      'open',
+      'do',
+      'in-progress',
       priority,
       'bug',
       planDesc,
       actualDesc,
-      'glitchtip-webhook',
+      'workbuddy-agent',
+      'auto-fix-pipeline' + gtIdTag,
       'Error originates from ' + environment + ' environment on the live production server.',
       'Error no longer appears in GlitchTip dashboard and no users are affected.'
     );
 
     const itemId = result.lastInsertRowid;
 
-    // Log the creation
     db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))")
       .run(itemId, '[GlitchTip] New error reported: ' + issueTitle + ' | Project: ' + projectSlug + ' | Env: ' + environment + ' | Level: ' + level + ' | Count: ' + eventCount);
 
     console.log('[GlitchTip→PDCA] Created #' + itemId + ': ' + issueTitle + ' [' + priority + '] from ' + projectSlug);
+
+    // 1. Notify you on Telegram immediately
+    const priorityEmoji = priority === 'critical' ? '🔴' : priority === 'high' ? '🟠' : '🟡';
+    sendTelegram(
+      `${priorityEmoji} *New production error — PDCA #${itemId}*\n` +
+      `*${issueTitle}*\n` +
+      `Priority: ${priority.toUpperCase()} | Env: ${environment}\n` +
+      (culprit ? `Location: \`${culprit}\`\n` : '') +
+      `Occurrences: ${eventCount} | Users affected: ${userCount}\n\n` +
+      `🤖 Auto-fix agent starting now...\n` +
+      `Track: https://pdca.konzult.in`
+    );
+
+    // 2. Spawn auto-fix agent (non-blocking)
+    triggerAutoFixAgent(itemId, '[GlitchTip] ' + issueTitle, planDesc);
+
     res.json({ ok: true, action: 'created', id: itemId, slug, priority });
   } catch (err) {
     console.error('[GlitchTip→PDCA] Error:', err.message);
@@ -672,26 +776,45 @@ function autoQueueUnlockedItems(completedItemId) {
 }
 
 // ── Mark item as complete (with auto-queue of unlocked children) ──────────────
-app.post('/api/items/:id/complete', (req, res) => {
+app.post('/api/items/:id/complete', express.json(), (req, res) => {
   try {
     const id = parseInt(req.params.id);
     const { actual_description, check_verdict } = req.body || {};
-    const row = db.prepare('SELECT id, status, project_id FROM pdca_items WHERE id = ?').get(id);
+    const row = db.prepare('SELECT id, status, project_id, title, remarks FROM pdca_items WHERE id = ?').get(id);
     if (!row) return res.status(404).json({ error: 'Item not found' });
 
-    const updates = ["status='complete'", "completed_at=datetime('now', 'localtime')", "chain_status='complete'"];
+    const updates = ["status='complete'", "completed_at=datetime('now', 'localtime')", "chain_status='complete'", "phase='act'"];
     if (actual_description) updates.push("actual_description='" + String(actual_description).replace(/'/g, "''") + "'");
     if (check_verdict) updates.push("check_verdict='" + String(check_verdict).replace(/'/g, "''") + "'");
 
     db.prepare('UPDATE pdca_items SET ' + updates.join(', ') + ' WHERE id = ?').run(id);
 
-    // Auto-queue any items that were blocked by this one and are now unblocked
     const autoQueued = autoQueueUnlockedItems(id);
 
     db.prepare("INSERT INTO pdca_logs (item_id, line, created_at) VALUES (?, ?, datetime('now','localtime'))").run(
       id,
       '[Complete] Item marked complete.' + (autoQueued.length > 0 ? ' Auto-queued ' + autoQueued.length + ' dependent item(s): ' + autoQueued.map(a => '#' + a.id).join(', ') : '')
     );
+
+    // If this was a GlitchTip auto-fix item — resolve the issue in GlitchTip + notify Telegram
+    const remarks = row.remarks || '';
+    const isGlitchTipItem = remarks.includes('auto-fix-pipeline') || row.title.startsWith('[GlitchTip]');
+    if (isGlitchTipItem) {
+      const gtIdMatch = remarks.match(/glitchtip_issue_id:\s*(\S+)/);
+      const gtIssueId = gtIdMatch ? gtIdMatch[1] : null;
+      if (gtIssueId) resolveGlitchTipIssue(gtIssueId);
+
+      const summary = actual_description
+        ? actual_description.slice(0, 300) + (actual_description.length > 300 ? '...' : '')
+        : 'Fixed and verified.';
+      sendTelegram(
+        `✅ *Auto-fix complete — PDCA #${id}*\n` +
+        `*${row.title}*\n\n` +
+        `${summary}\n\n` +
+        (gtIssueId ? `🔒 GlitchTip issue #${gtIssueId} resolved automatically.\n` : '') +
+        `View: https://pdca.konzult.in`
+      );
+    }
 
     res.json({ ok: true, message: 'Item #' + id + ' marked complete.', auto_queued: autoQueued });
   } catch (err) {
