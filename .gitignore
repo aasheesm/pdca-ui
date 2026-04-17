@@ -1,3 +1,6 @@
 node_modules/
 *.db
 x---temp-image/
+.env
+.env.local
+glitchtip-webhooks.jsonl

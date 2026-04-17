@@ -7,7 +7,200 @@ const session = require('express-session');
 const bcrypt = require('bcryptjs');
 const https = require('https');
 const http = require('http');
+const fs = require('fs');
 const { execFile } = require('child_process');
+
+// ── GlitchTip webhook raw-payload audit log ──────────────────────────────────
+const GT_WEBHOOK_LOG = '/root/data/assistant/glitchtip-webhooks.jsonl';
+function logRawWebhook(body, headers) {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      headers: {
+        'user-agent': headers['user-agent'],
+        'content-type': headers['content-type'],
+        'x-glitchtip-signature': headers['x-glitchtip-signature'] || null,
+      },
+      body,
+    }) + '\n';
+    fs.appendFile(GT_WEBHOOK_LOG, line, (e) => { if (e) console.error('[GT log]', e.message); });
+  } catch (e) { console.error('[GT log]', e.message); }
+}
+
+// ── Fetch full event (stack trace, breadcrumbs, request, browser) via API ────
+// Gracefully returns null on 403/timeout/network error — handler falls back
+// to whatever data the webhook body provided.
+function fetchLatestEvent(issueId, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    if (!GLITCHTIP_TOKEN || !issueId) return resolve(null);
+    const opts = {
+      hostname: GLITCHTIP_HOST,
+      path: `/api/0/issues/${issueId}/events/latest/`,
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${GLITCHTIP_TOKEN}`, 'Accept': 'application/json' },
+      timeout: timeoutMs,
+    };
+    const req = https.request(opts, (r) => {
+      if (r.statusCode !== 200) {
+        console.log(`[GT fetchEvent] issue=${issueId} HTTP ${r.statusCode}`);
+        r.resume(); return resolve(null);
+      }
+      let chunks = '';
+      r.on('data', (c) => { chunks += c; });
+      r.on('end', () => {
+        try { resolve(JSON.parse(chunks)); }
+        catch (e) { console.error('[GT fetchEvent parse]', e.message); resolve(null); }
+      });
+    });
+    req.on('error', (e) => { console.error('[GT fetchEvent error]', e.message); resolve(null); });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+// ── Helpers to extract deep fields from issue/event shapes ───────────────────
+function getTag(tagsCollection, key) {
+  if (!tagsCollection) return null;
+  if (Array.isArray(tagsCollection)) {
+    const t = tagsCollection.find(x => x?.key === key);
+    return t ? t.value : null;
+  }
+  if (typeof tagsCollection === 'object') return tagsCollection[key] || null;
+  return null;
+}
+
+function getExceptionFromEvent(event) {
+  const entry = event?.entries?.find(e => e.type === 'exception');
+  return entry?.data?.values?.[0] || null;
+}
+
+function getRequestFromEvent(event) {
+  const entry = event?.entries?.find(e => e.type === 'request');
+  return entry?.data || null;
+}
+
+function getBreadcrumbsFromEvent(event) {
+  const entry = event?.entries?.find(e => e.type === 'breadcrumbs');
+  return entry?.data?.values || [];
+}
+
+// ── Build a structured, agent-readable plan_description ──────────────────────
+function buildRichDescription({ issue, event, data }) {
+  const L = [];
+  const tags = issue.tags || event?.tags || [];
+  const contexts = event?.contexts || {};
+  const exception = getExceptionFromEvent(event);
+  const request = getRequestFromEvent(event);
+  const breadcrumbs = getBreadcrumbsFromEvent(event);
+
+  L.push('Source: GlitchTip (glitchtip.konzult.in)');
+  if (issue.permalink || issue.url) L.push('GlitchTip URL: ' + (issue.permalink || issue.url));
+  L.push('');
+
+  // Error
+  L.push('## Error');
+  L.push('Type: ' + (exception?.type || issue.metadata?.type || data.metadata?.type || 'Unknown'));
+  L.push('Message: ' + (exception?.value || issue.metadata?.value || data.metadata?.value || issue.title || data.title || 'No message'));
+  L.push('Level: ' + (issue.level || data.level || 'error'));
+  L.push('Occurrences: ' + (issue.count || 1) + '  |  Users affected: ' + (issue.userCount || 0));
+  if (issue.firstSeen) L.push('First seen: ' + issue.firstSeen);
+  if (issue.lastSeen) L.push('Last seen: ' + issue.lastSeen);
+  L.push('');
+
+  // Project
+  L.push('## Project');
+  L.push('Project: ' + (issue.project?.slug || data.project?.slug || 'unknown') +
+    ' (' + (issue.project?.platform || event?.platform || 'unknown') + ')');
+  L.push('Environment: ' + (getTag(tags, 'environment') || 'production'));
+  L.push('Release: ' + (getTag(tags, 'release') || event?.release || 'unknown'));
+  const runtime = getTag(tags, 'runtime') || contexts.runtime?.name;
+  if (runtime) L.push('Runtime: ' + runtime + (contexts.runtime?.version ? ' ' + contexts.runtime.version : ''));
+  const serverName = getTag(tags, 'server_name');
+  if (serverName) L.push('Server: ' + serverName);
+  L.push('');
+
+  // Location / Culprit
+  if (issue.culprit || event?.culprit) {
+    L.push('## Location');
+    L.push('Culprit: ' + (issue.culprit || event.culprit));
+    L.push('');
+  }
+
+  // Stack trace
+  const frames = exception?.stacktrace?.frames || [];
+  if (frames.length > 0) {
+    L.push('## Stack Trace (innermost first)');
+    const topFrames = frames.slice(-6).reverse();
+    topFrames.forEach((f, i) => {
+      const loc = [f.filename || f.module || '?', f.lineno, f.colno].filter(v => v !== undefined && v !== null && v !== '').join(':');
+      const func = f.function || '<anonymous>';
+      const ctx = f.context_line ? ' → ' + String(f.context_line).trim().slice(0, 140) : '';
+      L.push((i + 1) + '. ' + loc + ' in ' + func + ctx);
+    });
+    L.push('');
+  }
+
+  // Request
+  if (request) {
+    L.push('## Request');
+    if (request.url) L.push('URL: ' + (request.method || 'GET') + ' ' + request.url);
+    const headers = Array.isArray(request.headers) ? request.headers : (request.headers ? Object.entries(request.headers) : []);
+    const ua = headers.find(h => (h[0] || '').toLowerCase() === 'user-agent');
+    if (ua) L.push('User-Agent: ' + ua[1]);
+    L.push('');
+  }
+
+  // Client
+  if (contexts.browser || contexts.os || contexts.device) {
+    L.push('## Client');
+    if (contexts.browser) L.push('Browser: ' + (contexts.browser.name || '?') + ' ' + (contexts.browser.version || ''));
+    if (contexts.os) L.push('OS: ' + (contexts.os.name || '?') + ' ' + (contexts.os.version || ''));
+    if (contexts.device) L.push('Device: ' + [contexts.device.family, contexts.device.model].filter(Boolean).join(' '));
+    L.push('');
+  }
+
+  // User
+  if (event?.user) {
+    L.push('## User');
+    if (event.user.id) L.push('ID: ' + event.user.id);
+    if (event.user.email) L.push('Email: ' + event.user.email);
+    if (event.user.username) L.push('Username: ' + event.user.username);
+    if (event.user.ip_address) L.push('IP: ' + event.user.ip_address);
+    L.push('');
+  }
+
+  // Breadcrumbs
+  if (breadcrumbs.length > 0) {
+    L.push('## Breadcrumbs (last 6)');
+    breadcrumbs.slice(-6).forEach(b => {
+      const ts = b.timestamp ? (typeof b.timestamp === 'number'
+        ? new Date(b.timestamp * 1000).toISOString().slice(11, 19)
+        : String(b.timestamp).slice(11, 19))
+        : '?';
+      const cat = b.category || b.type || 'event';
+      const msg = b.message || (b.data ? JSON.stringify(b.data).slice(0, 120) : '');
+      L.push(ts + ' | ' + cat + ' | ' + msg);
+    });
+    L.push('');
+  }
+
+  // Tags dump (compact)
+  if (Array.isArray(tags) && tags.length > 0) {
+    L.push('## Tags');
+    L.push(tags.map(t => (t.key || '') + '=' + (t.value || '')).filter(s => s.length > 1).join(', '));
+    L.push('');
+  }
+
+  L.push('---');
+  L.push('🤖 Agent briefing:');
+  L.push('1. Start with the innermost stack frame — open that file at the given line and inspect the context_line expression.');
+  L.push('2. Reproduce locally using the Request/User/Breadcrumbs context above.');
+  L.push('3. Fix the root cause (not the symptom), add/adjust tests, commit, push to main.');
+  L.push('4. POST https://pdca.konzult.in/api/items/<THIS_ID>/complete with actual_description summarising the fix.');
+  L.push('   When marked complete, the GlitchTip issue is auto-resolved (requires GLITCHTIP_TOKEN with event:admin scope).');
+
+  return L.join('\n');
+}
 
 // ── Telegram notifier ─────────────────────────────────────────────────────────
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8661099102:AAGEoNeWRtwLILuxPzbjj-sJe1A1CdHj6O4';
@@ -226,25 +419,32 @@ function requireAuth(req, res, next) {
 // ── GlitchTip Webhook → PDCA Integration ──────────────────────────────────────
 // Receives error alerts from GlitchTip and auto-creates PDCA items.
 // Must be BEFORE the auth middleware since GlitchTip calls us without session.
-app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
+app.post('/api/glitchtip-webhook', express.json({ limit: '2mb' }), async (req, res) => {
   try {
     const body = req.body;
+    logRawWebhook(body, req.headers);
+
     const data = body.data || body;
     const issue = data.issue || {};
 
-    // Extract info from GlitchTip alert payload
-    const issueTitle = issue.title || data.title || data.message || 'Untitled Error';
-    const issueUrl = issue.url || '';
-    const projectSlug = (issue.project?.slug || data.project?.slug || 'unknown').toLowerCase();
-    const level = issue.level ?? data.level ?? 'error';
-    const culprit = issue.culprit || '';
+    // Identify issue for API enrichment
+    const glitchtipIssueId = issue.id || data.id || null;
+
+    // Best-effort fetch of full event (graceful on 403/timeout)
+    const event = await fetchLatestEvent(glitchtipIssueId).catch(() => null);
+
+    // Extract info from webhook + event
+    const exception = getExceptionFromEvent(event);
+    const issueTitle = exception?.value || exception?.type ||
+                       issue.title || data.title || data.message || issue.metadata?.value || 'Untitled Error';
+    const projectSlug = (issue.project?.slug || data.project?.slug || event?.project?.slug || 'unknown').toLowerCase();
+    const level = issue.level ?? data.level ?? event?.level ?? 'error';
+    const culprit = issue.culprit || event?.culprit || '';
     const eventCount = issue.count || 1;
     const userCount = issue.userCount || 0;
-    const firstSeen = issue.firstSeen || '';
-    const lastSeen = issue.lastSeen || '';
-    const tags = issue.tags || [];
-    const environment = (tags.find(t => t?.key === 'environment') || {}).value || 'production';
-    const release = (tags.find(t => t?.key === 'release') || {}).value || 'unknown';
+    const tags = issue.tags || event?.tags || [];
+    const environment = getTag(tags, 'environment') || 'production';
+    const release = getTag(tags, 'release') || event?.release || 'unknown';
 
     // Map severity: fatal/critical → critical, error → high, warning → medium, else → low
     let priority = 'medium';
@@ -253,46 +453,36 @@ app.post('/api/glitchtip-webhook', express.json(), (req, res) => {
     else if (level === 'warning' || level === 2) priority = 'medium';
     else priority = 'low';
 
-    // Map project slug to PDCA project
-    let pdcaProjectId = 'WorkBuddy';
-    if (projectSlug.includes('native') || projectSlug.includes('mobile') || projectSlug.includes('app')) {
-      pdcaProjectId = 'WorkBuddy';
-    } else if (projectSlug.includes('backend') || projectSlug.includes('api') || projectSlug.includes('server')) {
-      pdcaProjectId = 'WorkBuddy';
-    }
+    // Map project slug to PDCA project (all webhooks land in WorkBuddy for now)
+    const pdcaProjectId = 'WorkBuddy';
 
-    // Build slug from title
+    // Build slug from a short, stable title fragment
     const slugBase = issueTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
     const slug = 'glitch-' + slugBase + '-' + Date.now().toString(36);
 
-    // Rich description with source tracking
-    const planDesc = [
-      'Source: GlitchTip (glitchtip.konzult.in)',
-      'Project: ' + projectSlug,
-      'Environment: ' + environment,
-      'Level: ' + level,
-      'Release: ' + release,
-      'Occurrences: ' + eventCount,
-      'Users affected: ' + userCount,
-      lastSeen ? 'Last seen: ' + lastSeen : '',
-      firstSeen ? 'First seen: ' + firstSeen : '',
-      culprit ? 'Location: ' + culprit : '',
-      issueUrl ? 'GlitchTip URL: ' + issueUrl : '',
-      '---',
-      'This issue was auto-reported from the live production server.',
-      'Fix this and mark the PDCA item as complete.'
-    ].filter(Boolean).join('\n');
+    // Rich, agent-friendly plan description
+    const planDesc = buildRichDescription({ issue, event, data });
+    const enriched = Boolean(event);
 
-    const actualDesc = 'Auto-created from GlitchTip alert. ' + eventCount + ' occurrence(s) from ' + environment + '. ' + userCount + ' user(s) affected.';
+    const actualDesc = 'Auto-created from GlitchTip alert. ' + eventCount + ' occurrence(s) from ' + environment +
+      '. ' + userCount + ' user(s) affected.' + (enriched ? ' Enriched from /events/latest API.' : ' (webhook-only; token may lack event:read scope)');
 
     // Store GlitchTip issue ID for two-way sync (resolve on complete)
-    const glitchtipIssueId = issue.id || data.id || null;
     const gtIdTag = glitchtipIssueId ? `\nglitchtip_issue_id: ${glitchtipIssueId}` : '';
 
-    // Avoid duplicates: check if similar open issue exists
-    const existing = db.prepare(
-      "SELECT id, status, remarks FROM pdca_items WHERE project_id = ? AND title LIKE ? AND status IN ('open','in-progress','queued') ORDER BY id DESC LIMIT 1"
-    ).get(pdcaProjectId, '%' + issueTitle.slice(0, 50) + '%');
+    // Avoid duplicates: prefer match by glitchtip_issue_id in remarks; fall back
+    // to title substring for webhooks that arrived before we tracked the id.
+    let existing = null;
+    if (glitchtipIssueId) {
+      existing = db.prepare(
+        "SELECT id, status, remarks FROM pdca_items WHERE project_id = ? AND remarks LIKE ? AND status IN ('open','in-progress','queued') ORDER BY id DESC LIMIT 1"
+      ).get(pdcaProjectId, '%glitchtip_issue_id: ' + glitchtipIssueId + '%');
+    }
+    if (!existing) {
+      existing = db.prepare(
+        "SELECT id, status, remarks FROM pdca_items WHERE project_id = ? AND title LIKE ? AND status IN ('open','in-progress','queued') ORDER BY id DESC LIMIT 1"
+      ).get(pdcaProjectId, '%' + issueTitle.slice(0, 50) + '%');
+    }
 
     if (existing) {
       db.prepare("UPDATE pdca_items SET actual_description = ? WHERE id = ?")
@@ -389,6 +579,77 @@ app.get('/api/projects', (req, res) => {
       'SELECT DISTINCT project_id FROM pdca_items ORDER BY project_id'
     ).all();
     res.json(rows.map(r => r.project_id));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Prospect Tracker API ──────────────────────────────────────────────────────
+app.get('/api/prospects', (req, res) => {
+  try {
+    const prospects = db.prepare('SELECT * FROM wb_prospects ORDER BY tier ASC, created_at DESC').all();
+    const summary = db.prepare(`
+      SELECT status, COUNT(*) as count, SUM(COALESCE(amount_inr,0)) as total
+      FROM wb_prospects GROUP BY status
+    `).all();
+    const totals = db.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN status='closed_won' THEN 1 ELSE 0 END) as closed_won,
+        SUM(CASE WHEN status='closed_won' THEN COALESCE(amount_inr,0) ELSE 0 END) as revenue,
+        SUM(CASE WHEN status='objection_subscription' THEN 1 ELSE 0 END) as sub_objections
+      FROM wb_prospects
+    `).get();
+    res.json({ prospects, summary, totals });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/prospects', express.json(), (req, res) => {
+  try {
+    const p = req.body;
+    const result = db.prepare(`
+      INSERT INTO wb_prospects
+      (contact_name, company, segment, tier, relationship, city, phone, email, linkedin, status, notes)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      p.contact_name, p.company, p.segment, p.tier || 'A',
+      p.relationship, p.city, p.phone, p.email, p.linkedin,
+      p.status || 'new', p.notes || ''
+    );
+    res.json({ ok: true, id: result.lastInsertRowid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/prospects/:id/status', express.json(), (req, res) => {
+  try {
+    const { status, notes, amount_inr, plan } = req.body;
+    const updates = ['status=?', 'updated_at=CURRENT_TIMESTAMP'];
+    const params = [status];
+    if (notes !== undefined) { updates.push('notes=?'); params.push(notes); }
+    if (amount_inr !== undefined) { updates.push('amount_inr=?'); params.push(amount_inr); }
+    if (plan !== undefined) { updates.push('plan=?'); params.push(plan); }
+    if (status === 'closed_won') { updates.push('close_date=date("now")'); }
+    if (status === 'demo_done') { updates.push('demo_date=date("now")'); }
+    params.push(req.params.id);
+    db.prepare(`UPDATE wb_prospects SET ${updates.join(', ')} WHERE id=?`).run(...params);
+    db.prepare('INSERT INTO wb_prospect_activity (prospect_id, activity_type, notes) VALUES (?, ?, ?)')
+      .run(req.params.id, status, notes || '');
+
+    // Auto-trigger check: if objection_subscription hits 5+, flag PDCA #464
+    if (status === 'objection_subscription') {
+      const count = db.prepare("SELECT COUNT(*) as c FROM wb_prospects WHERE status='objection_subscription'").get().c;
+      if (count >= 5) {
+        db.prepare(`INSERT INTO pdca_logs (item_id, line, created_at)
+          VALUES ((SELECT id FROM pdca_items WHERE slug='wb-perpetual-license-strategy'),
+                  ?, datetime('now','localtime'))`)
+          .run(`[TRIGGER] ${count} prospects have subscription objection — perpetual license MVP should now be built.`);
+      }
+    }
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
