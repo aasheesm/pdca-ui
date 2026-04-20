@@ -8,6 +8,7 @@ const bcrypt = require('bcryptjs');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const path = require('path');
 const { execFile } = require('child_process');
 
 // ── GlitchTip webhook raw-payload audit log ──────────────────────────────────
@@ -544,6 +545,13 @@ app.post('/api/glitchtip-webhook', express.json({ limit: '2mb' }), async (req, r
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── Static reports hub — no auth required so links can be shared freely ──────
+// Files placed in public/reports/ are served at /reports/<filename>
+app.use('/reports', express.static(path.join(__dirname, 'public/reports'), {
+  index: 'index.html',
+  extensions: ['html'],
+}));
 
 app.use(requireAuth);
 
@@ -1592,6 +1600,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     transition: all 0.12s;
     white-space: nowrap;
     overflow: hidden;
+    text-decoration: none;
   }
   .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text); }
   .nav-item.active {
@@ -2247,6 +2256,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="nav-item" data-page="cycles"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 0 1-11.13 4.58"/><path d="M3.5 10A6.5 6.5 0 0 1 14.63 5.42"/><path d="M14.63 5.42L16 4m-1.37 1.42L16 7.5"/><path d="M5.37 14.58L4 16m1.37-1.42L4 12.5"/></svg></span><span class="nav-label">Cycles</span></div>
     <div class="nav-item" data-page="file-changes"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6a2 2 0 0 1 2-2h3.172a2 2 0 0 1 1.414.586l1.414 1.414H16a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6z"/></svg></span><span class="nav-label">File Changes</span></div>
     <div class="nav-item" data-page="activities"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg></span><span class="nav-label">Activity Log</span></div>
+    <a class="nav-item" href="/reports" id="navReports"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h7l4 4v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M12 3v4h4"/><path d="M7 9h6M7 12h6M7 15h4"/><circle cx="7" cy="9" r="0.6" fill="currentColor"/><circle cx="7" cy="12" r="0.6" fill="currentColor"/><circle cx="7" cy="15" r="0.6" fill="currentColor"/></svg></span><span class="nav-label">Reports</span></a>
+    <a class="nav-item" href="/data" id="navData"><span class="nav-icon"><svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="10" cy="4.5" rx="6.5" ry="2"/><path d="M3.5 4.5v5c0 1.1 2.9 2 6.5 2s6.5-.9 6.5-2v-5"/><path d="M3.5 9.5v6c0 1.1 2.9 2 6.5 2s6.5-.9 6.5-2v-6"/></svg></span><span class="nav-label">Data</span></a>
   </nav>
   <div class="sb-footer">
     <button class="collapse-btn" id="collapseBtn">
@@ -4735,6 +4746,641 @@ document.addEventListener('scroll', function(e) {
 </div>
 </body>
 </html>`;
+
+// ── Data browser HTML (self-contained page with JS table renderer) ──────────
+const DATA_BROWSER_HTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Data — PDCA Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #151823; --border: #2d3148; --text: #e2e8f0;
+    --muted: #64748b; --accent: #60a5fa; --success: #22c55e; --danger: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, system-ui, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px;
+  }
+  header {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 12px 20px; display: flex; align-items: center; gap: 16px;
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header a.back {
+    color: var(--muted); text-decoration: none; font-size: 13px;
+    padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
+  }
+  header a.back:hover { color: var(--accent); border-color: var(--accent); }
+  .tabs {
+    display: flex; gap: 4px; padding: 12px 20px 0; flex-wrap: wrap;
+    background: var(--card); border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    padding: 8px 14px; background: transparent; border: 1px solid transparent;
+    color: var(--muted); cursor: pointer; border-radius: 6px 6px 0 0;
+    font-size: 13px; transition: all 0.15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--accent); background: var(--bg);
+    border-color: var(--border); border-bottom-color: var(--bg);
+    margin-bottom: -1px;
+  }
+  .toolbar {
+    display: flex; gap: 10px; padding: 14px 20px; align-items: center;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .search {
+    flex: 1; min-width: 200px; max-width: 400px;
+    padding: 8px 12px; background: var(--card); border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; font-size: 13px;
+  }
+  .count { color: var(--muted); font-size: 12px; }
+  .pager { display: flex; gap: 6px; margin-left: auto; }
+  .pager button {
+    padding: 6px 12px; background: var(--card); border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  .pager button:disabled { opacity: 0.3; cursor: not-allowed; }
+  .pager button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .table-wrap {
+    padding: 0 20px 40px; overflow-x: auto;
+  }
+  table {
+    width: 100%; border-collapse: collapse; font-size: 12.5px;
+    background: var(--card); border-radius: 8px; overflow: hidden;
+    margin-top: 12px;
+  }
+  thead { background: #1a1e2e; }
+  th, td {
+    padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);
+    vertical-align: top; word-break: break-word; max-width: 320px;
+  }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+  tr:hover td { background: #181c2a; }
+  td { color: var(--text); }
+  td.wrap { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 11.5px; max-width: 500px; }
+  .empty { text-align: center; padding: 60px 20px; color: var(--muted); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+  .b-new { background: #1e3a8a; color: #93c5fd; }
+  .b-contacted { background: #374151; color: #d1d5db; }
+  .b-demo_done { background: #065f46; color: #86efac; }
+  .b-closed_won { background: #166534; color: #bbf7d0; }
+  .b-closed_lost, .b-objection_price, .b-objection_subscription { background: #7f1d1d; color: #fca5a5; }
+  .b-pending { background: #78350f; color: #fcd34d; }
+  .b-in_progress { background: #1e3a8a; color: #93c5fd; }
+  .b-complete, .b-done { background: #065f46; color: #86efac; }
+  .b-failed { background: #7f1d1d; color: #fca5a5; }
+  .dir-incoming { color: #60a5fa; }
+  .dir-outgoing { color: #22c55e; }
+  .cron-group {
+    margin-top: 20px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .cron-group-head {
+    padding: 10px 16px; background: #1a1e2e; font-weight: 600;
+    font-size: 14px; color: var(--text); border-bottom: 1px solid var(--border);
+  }
+  .cron-count { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .cron-table { border-radius: 0; margin: 0; }
+  .cron-table th { background: transparent; }
+</style></head><body>
+<header>
+  <a href="/" class="back">← Back to PDCA</a>
+  <h1>Data Browser</h1>
+</header>
+<div class="tabs" id="tabBar"></div>
+<div class="toolbar">
+  <input type="text" id="searchBox" class="search" placeholder="Search..." />
+  <span class="count" id="countLabel">0 rows</span>
+  <div class="pager">
+    <button id="prevBtn">‹ Prev</button>
+    <span id="pageLabel" style="color:var(--muted);font-size:12px;padding:0 8px;line-height:26px"></span>
+    <button id="nextBtn">Next ›</button>
+  </div>
+</div>
+<div class="table-wrap"><div id="tableContainer"></div></div>
+<script>
+const VIEWS = [
+  { key: 'prospects', label: '💰 Prospects' },
+  { key: 'contacts', label: '👥 Contacts' },
+  { key: 'tasks', label: '✅ Tasks' },
+  { key: 'meetings', label: '📅 Meetings' },
+  { key: 'decisions', label: '💡 Decisions' },
+  { key: 'conversations', label: '💬 Conversations' },
+  { key: 'crons', label: '⏰ Cron Jobs' },
+];
+const PAGE_SIZE = 50;
+let state = { view: 'prospects', q: '', offset: 0, total: 0 };
+
+function renderTabs() {
+  const bar = document.getElementById('tabBar');
+  bar.innerHTML = VIEWS.map(v =>
+    '<button class="tab ' + (v.key === state.view ? 'active' : '') + '" data-view="' + v.key + '">' + v.label + '</button>'
+  ).join('');
+  bar.querySelectorAll('.tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.view = btn.dataset.view;
+      state.offset = 0;
+      state.q = '';
+      document.getElementById('searchBox').value = '';
+      renderTabs();
+      load();
+    });
+  });
+}
+
+function formatCell(col, value) {
+  if (value === null || value === undefined) return '<span style="color:var(--muted)">—</span>';
+  if (typeof value === 'number') {
+    if (col === 'amount_inr') return '₹' + value.toLocaleString('en-IN');
+    return String(value);
+  }
+  const s = String(value);
+  if (col === 'status' || col === 'tier' || col === 'priority') {
+    const cls = 'b-' + s.toLowerCase().replace(/[^a-z_]/g, '');
+    return '<span class="badge ' + cls + '">' + escapeHtml(s) + '</span>';
+  }
+  if (col === 'direction') {
+    return '<span class="dir-' + s.toLowerCase() + '">' + escapeHtml(s) + '</span>';
+  }
+  if (col === 'message_text' || col === 'notes' || col === 'context' || col === 'outcome') {
+    const truncated = s.length > 200 ? s.slice(0, 200) + '…' : s;
+    return '<div class="wrap">' + escapeHtml(truncated) + '</div>';
+  }
+  if (col === 'phone' || col === 'email') return '<code style="font-size:11.5px">' + escapeHtml(s) + '</code>';
+  if (col === 'ts' || col.endsWith('_at') || col === 'date' || col === 'due_date' || col === 'scheduled_at' || col === 'demo_date' || col === 'close_date' || col === 'last_contact_date') {
+    const short = s.length > 16 ? s.slice(0, 16).replace('T', ' ') : s;
+    return '<span style="color:var(--muted);font-size:11.5px">' + escapeHtml(short) + '</span>';
+  }
+  return escapeHtml(s);
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
+  );
+}
+
+async function load() {
+  const params = new URLSearchParams({
+    limit: PAGE_SIZE, offset: state.offset,
+    ...(state.q ? { q: state.q } : {})
+  });
+  try {
+    const r = await fetch('/api/data/' + state.view + '?' + params);
+    if (r.status === 401) { window.location = '/login'; return; }
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+
+    state.total = data.total || 0;
+    document.getElementById('countLabel').textContent =
+      (data.missing ? 'Table missing' : data.total.toLocaleString() + ' total');
+
+    const from = state.total === 0 ? 0 : state.offset + 1;
+    const to = Math.min(state.offset + PAGE_SIZE, state.total);
+    document.getElementById('pageLabel').textContent =
+      state.total === 0 || state.view === 'crons' ? '' : from + '–' + to + ' of ' + state.total.toLocaleString();
+    document.getElementById('prevBtn').disabled = state.offset === 0 || state.view === 'crons';
+    document.getElementById('nextBtn').disabled = state.offset + PAGE_SIZE >= state.total || state.view === 'crons';
+
+    const box = document.getElementById('tableContainer');
+    if (!data.rows || data.rows.length === 0) {
+      box.innerHTML = '<div class="empty">No ' + state.view + ' found' +
+                      (state.q ? ' for "' + escapeHtml(state.q) + '"' : '') + '.</div>';
+      return;
+    }
+
+    // Special renderer for grouped cron jobs
+    if (state.view === 'crons' && data.groups) {
+      box.innerHTML = renderCronGroups(data.groups);
+      return;
+    }
+
+    const cols = data.columns;
+    let html = '<table><thead><tr>' +
+      cols.map(c => '<th>' + c.replace(/_/g, ' ') + '</th>').join('') +
+      '</tr></thead><tbody>';
+    for (const row of data.rows) {
+      html += '<tr>' + cols.map(c => '<td>' + formatCell(c, row[c]) + '</td>').join('') + '</tr>';
+    }
+    html += '</tbody></table>';
+    box.innerHTML = html;
+  } catch (e) {
+    document.getElementById('tableContainer').innerHTML =
+      '<div class="empty" style="color:var(--danger)">Error: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function renderCronGroups(groups) {
+  // Order categories by importance
+  const ORDER = [
+    '📱 Content Digests',
+    '☀️ Daily Briefings',
+    '💼 WorkBuddy Sales',
+    '🏥 Health & Monitoring',
+    '💾 Backups & Data Hygiene',
+    '🤖 PDCA Automation',
+    '📊 Reports & Analytics',
+    '🔧 Infrastructure',
+    '❓ Other',
+  ];
+  let html = '';
+  const keys = Object.keys(groups).sort((a, b) => {
+    const ai = ORDER.indexOf(a), bi = ORDER.indexOf(b);
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+  });
+  for (const cat of keys) {
+    const jobs = groups[cat];
+    html += '<div class="cron-group">' +
+      '<div class="cron-group-head">' + escapeHtml(cat) + ' <span class="cron-count">(' + jobs.length + ')</span></div>' +
+      '<table class="cron-table"><thead><tr>' +
+        '<th style="width:22%">Schedule</th>' +
+        '<th style="width:30%">What it does</th>' +
+        '<th style="width:30%">Command</th>' +
+        '<th style="width:18%">Last run</th>' +
+      '</tr></thead><tbody>';
+    for (const j of jobs) {
+      const cmdShort = (j.command || '').replace(/^\/usr\/bin\/python3\s+/, '').replace(/^\/bin\/bash\s+/, '');
+      html += '<tr>' +
+        '<td><code style="font-size:11.5px;color:#93c5fd">' + escapeHtml(j.human || j.schedule) + '</code></td>' +
+        '<td>' + escapeHtml(j.description || '—') + '</td>' +
+        '<td><code style="font-size:11px;color:var(--muted)">' + escapeHtml(cmdShort.slice(0, 100)) + '</code></td>' +
+        '<td>' + (j.last_run ? '<span style="color:var(--muted);font-size:11.5px">' + escapeHtml(j.last_run) + '</span>' : '<span style="color:#ef4444;font-size:11px">never</span>') + '</td>' +
+        '</tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+  return html;
+}
+
+let searchTimer;
+document.getElementById('searchBox').addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.q = e.target.value.trim();
+    state.offset = 0;
+    load();
+  }, 300);
+});
+document.getElementById('prevBtn').addEventListener('click', () => {
+  state.offset = Math.max(0, state.offset - PAGE_SIZE); load();
+});
+document.getElementById('nextBtn').addEventListener('click', () => {
+  state.offset += PAGE_SIZE; load();
+});
+
+renderTabs();
+load();
+</script></body></html>`;
+
+// ── /data — Generic data viewer (5 tabs: prospects, contacts, tasks, decisions, conversations) ────
+
+// Whitelist of browsable tables + their display columns + optional search SQL
+const DATA_VIEWS = {
+  prospects: {
+    label: 'Sales Prospects',
+    table: 'wb_prospects',
+    columns: ['id', 'contact_name', 'company', 'tier', 'segment', 'city',
+              'status', 'amount_inr', 'phone', 'email', 'demo_date',
+              'close_date', 'notes'],
+    order_by: 'created_at DESC',
+    search_cols: ['contact_name', 'company', 'segment', 'city', 'email', 'notes'],
+  },
+  contacts: {
+    label: 'Contacts',
+    table: 'contacts',
+    columns: ['id', 'name', 'phone', 'company', 'notes',
+              'last_contact', 'created_at'],
+    order_by: 'COALESCE(last_contact, created_at) DESC',
+    search_cols: ['name', 'phone', 'company', 'notes'],
+  },
+  tasks: {
+    label: 'Tasks',
+    table: 'tasks',
+    columns: ['id', 'title', 'status', 'priority', 'due_date',
+              'project', 'scheduled_at', 'source', 'created_at'],
+    order_by: 'CASE WHEN status IN (\'pending\',\'in_progress\') THEN 0 ELSE 1 END, due_date ASC',
+    search_cols: ['title', 'description', 'project'],
+  },
+  meetings: {
+    label: 'Meetings',
+    table: 'meetings',
+    columns: ['id', 'contact_name', 'company', 'topic', 'scheduled_at',
+              'duration_mins', 'status', 'notes', 'outcome'],
+    order_by: 'scheduled_at DESC',
+    search_cols: ['contact_name', 'company', 'topic', 'notes', 'outcome'],
+  },
+  decisions: {
+    label: 'Decisions',
+    table: 'decisions',
+    columns: ['id', 'date', 'project', 'title', 'context', 'decision', 'tags', 'source'],
+    order_by: 'date DESC',
+    search_cols: ['title', 'project', 'context', 'decision', 'tags'],
+  },
+  conversations: {
+    label: 'Conversations',
+    table: 'conversation_log',
+    columns: ['id', 'ts', 'direction', 'message_text', 'message_id', 'session_date'],
+    order_by: 'ts DESC',
+    search_cols: ['message_text'],
+  },
+};
+
+// Categorize a cron job by its command string.
+// Returns { category, description, logPath }.
+function categorizeCron(command) {
+  const c = command.toLowerCase();
+
+  // Content Digests — overnight content scraping
+  if (c.includes('yt_digest')) return { category: '📱 Content Digests', description: 'YouTube: scrape + summarize trending videos', logPath: '/var/log/yt_digest.log' };
+  if (c.includes('hn_digest')) return { category: '📱 Content Digests', description: 'Hacker News: top stories + analysis', logPath: '/var/log/hn_digest.log' };
+  if (c.includes('github_stars')) return { category: '📱 Content Digests', description: 'GitHub trending repos of the day', logPath: '/var/log/github_stars.log' };
+  if (c.includes('producthunt_digest')) return { category: '📱 Content Digests', description: 'Product Hunt: new launches', logPath: '/var/log/producthunt_digest.log' };
+  if (c.includes('reddit_digest')) return { category: '📱 Content Digests', description: 'Reddit: 12 subreddits RSS roundup', logPath: '/var/log/reddit_digest.log' };
+  if (c.includes('devto_digest')) return { category: '📱 Content Digests', description: 'Dev.to: trending articles', logPath: '/var/log/devto_digest.log' };
+  if (c.includes('twitter_digest')) return { category: '📱 Content Digests', description: 'Twitter/X via Nitter RSS (fragile)', logPath: '/var/log/twitter_digest.log' };
+  if (c.includes('astroguide') && c.includes('digest')) return { category: '📱 Content Digests', description: 'AstroGuide daily horoscope digest', logPath: '/var/log/astroguide-digest.log' };
+
+  // Daily Briefings & Consolidation
+  if (c.includes('ideation-curator')) return { category: '☀️ Daily Briefings', description: 'Consolidates all digests → vault + Telegram summary', logPath: '/var/log/ideation-curator.log' };
+  if (c.includes('briefing.sh')) {
+    if (c.includes('morning')) return { category: '☀️ Daily Briefings', description: 'Morning briefing: meetings, tasks, priorities', logPath: '/var/log/pulse-briefing.log' };
+    if (c.includes('midday')) return { category: '☀️ Daily Briefings', description: 'Midday check-in: progress + afternoon plan', logPath: '/var/log/pulse-briefing.log' };
+    if (c.includes('afternoon')) return { category: '☀️ Daily Briefings', description: 'Afternoon: what\'s left, tea reminders', logPath: '/var/log/pulse-briefing.log' };
+    if (c.includes('evening')) return { category: '☀️ Daily Briefings', description: 'Evening wrap-up: done + tomorrow prep', logPath: '/var/log/pulse-briefing.log' };
+    return { category: '☀️ Daily Briefings', description: 'Pulse briefing (periodic)', logPath: '/var/log/pulse-briefing.log' };
+  }
+  if (c.includes('prep_briefing')) return { category: '☀️ Daily Briefings', description: '9 PM: prepare tomorrow\'s context', logPath: '/var/log/prep-briefing.log' };
+  if (c.includes('overnight_processor')) return { category: '☀️ Daily Briefings', description: '11 PM: process overnight tasks + data', logPath: '/var/log/overnight.log' };
+  if (c.includes('task_nudge')) return { category: '☀️ Daily Briefings', description: '11 AM: nudge user on overdue tasks', logPath: '/var/log/task-nudge.log' };
+  if (c.includes('recurring_tasks')) return { category: '☀️ Daily Briefings', description: '7:50 AM: recreate recurring tasks', logPath: '/var/log/pulse-recurring.log' };
+  if (c.includes('heal_summary')) return { category: '☀️ Daily Briefings', description: '7 AM: overnight healing/fix summary', logPath: '/var/log/uptime.log' };
+
+  // WorkBuddy Sales
+  if (c.includes('send-telegram-briefing')) return { category: '💼 WorkBuddy Sales', description: 'Runway scorecard + 4 morning bullets (8am/7pm)', logPath: '/root/projects/workbuddy/sales/briefing.log' };
+  if (c.includes('wa_poller')) return { category: '💼 WorkBuddy Sales', description: 'WhatsApp new-message poller (every 15min)', logPath: '/var/log/wa_poller.log' };
+  if (c.includes('pdca-workbuddy-trigger')) return { category: '💼 WorkBuddy Sales', description: 'PDCA trigger for WorkBuddy project', logPath: '/root/logs/pdca-workbuddy.log' };
+  if (c.includes('seo-audit')) return { category: '💼 WorkBuddy Sales', description: 'Weekly SEO audit of theworkbuddy.app', logPath: '/root/logs/seo-audit.log' };
+  if (c.includes('proposal_reminders')) return { category: '💼 WorkBuddy Sales', description: '9 AM: follow up on sent proposals', logPath: '/root/logs/proposal_reminders.log' };
+  if (c.includes('post_meeting_followup')) return { category: '💼 WorkBuddy Sales', description: 'Every 15min: auto-followup after meetings', logPath: '/var/log/post-meeting.log' };
+  if (c.includes('contact_intelligence')) return { category: '💼 WorkBuddy Sales', description: 'Mon 9 AM: weekly contact intelligence digest', logPath: '/var/log/contact-intel.log' };
+  if (c.includes('konzult_weekly_refresh')) return { category: '💼 WorkBuddy Sales', description: 'Mon 7:30 AM: refresh Konzult client sites', logPath: '/root/telebot/logs/cron/konzult_weekly_refresh.log' };
+  if (c.includes('konzult_monthly_sync')) return { category: '💼 WorkBuddy Sales', description: 'Monthly: Konzult photo sync to CDN', logPath: '/root/telebot/logs/cron/konzult_monthly_sync.log' };
+
+  // Health & Monitoring
+  if (c.includes('health_monitor.sh')) return { category: '🏥 Health & Monitoring', description: 'Server health ping every 10 min', logPath: '/root/telebot/logs/cron/health_monitor.log' };
+  if (c.includes('health-alert')) return { category: '🏥 Health & Monitoring', description: 'Every 6hr: alert on failed services', logPath: '/var/log/health-alert.log' };
+  if (c.includes('uptime_monitor')) return { category: '🏥 Health & Monitoring', description: 'Uptime probe every 30 min', logPath: '/var/log/uptime.log' };
+  if (c.includes('bot-health-check')) return { category: '🏥 Health & Monitoring', description: 'Every 6hr: verify Telegram bot responsiveness', logPath: '/var/log/bot-health.log' };
+  if (c.includes('daily_health_audit')) return { category: '🏥 Health & Monitoring', description: '12:30 PM: daily server audit', logPath: '/root/telebot/logs/cron/daily_health_audit.log' };
+  if (c.includes('claude-channels-watchdog')) return { category: '🏥 Health & Monitoring', description: 'Every 5min: restart Claude Channels if dead', logPath: '/var/log/claude-channels-watchdog.log' };
+  if (c.includes('claude-channels-refresh')) return { category: '🏥 Health & Monitoring', description: '3×daily: refresh Claude Channels session', logPath: '/var/log/claude-channels-refresh.log' };
+  if (c.includes('crontab-sentinel')) return { category: '🏥 Health & Monitoring', description: 'Every 2hr: alert on crontab entry drops', logPath: '/var/log/crontab-sentinel.log' };
+
+  // Backups & Data Hygiene
+  if (c.includes('daily-backup')) return { category: '💾 Backups & Data Hygiene', description: '3 AM: full server backup (DBs, configs, memory)', logPath: '/var/log/daily-backup.log' };
+  if (c.includes('weekly_memory_decay')) return { category: '💾 Backups & Data Hygiene', description: 'Sun 3 AM: age-out stale memory entries', logPath: '/root/telebot/logs/cron/memory_decay.log' };
+  if (c.includes('session_summaries')) return { category: '💾 Backups & Data Hygiene', description: 'Sun 3 AM: prune session summaries > 7d', logPath: 'sqlite-inline' };
+  if (c.includes('edit_log')) return { category: '💾 Backups & Data Hygiene', description: 'Monthly: prune edit_log > 30d', logPath: 'sqlite-inline' };
+  if (c.includes('conversation_log')) return { category: '💾 Backups & Data Hygiene', description: 'Monthly: prune conversation_log > 90d', logPath: 'sqlite-inline' };
+  if (c.includes('cleanup-audio-inbox')) return { category: '💾 Backups & Data Hygiene', description: 'Every 30min: clean Telegram audio inbox', logPath: '/var/log/cleanup-audio.log' };
+  if (c.includes('progress-snapshot')) return { category: '💾 Backups & Data Hygiene', description: 'Every 30min: snapshot work progress', logPath: '/var/log/progress-snapshot.log' };
+
+  // PDCA & Automation
+  if (c.includes('pdca-queue-processor')) return { category: '🤖 PDCA Automation', description: 'Every 2min: dispatch queued PDCA items', logPath: '/root/logs/pdca-queue-processor.log' };
+  if (c.includes('pdca-stuck-reset')) return { category: '🤖 PDCA Automation', description: 'Every 30min: reset stuck PDCA items', logPath: '/root/logs/pdca-stuck-reset.log' };
+
+  // Reports & Analytics
+  if (c.includes('weekly_review')) return { category: '📊 Reports & Analytics', description: 'Sun 8 PM: weekly review digest', logPath: '/var/log/weekly-review.log' };
+  if (c.includes('friday_revenue_checkin')) return { category: '📊 Reports & Analytics', description: 'Fri 11:30 PM: revenue check-in', logPath: '/root/telebot/logs/cron/friday_revenue_checkin.log' };
+  if (c.includes('daily_social_content')) return { category: '📊 Reports & Analytics', description: '11:30 AM: generate daily social content', logPath: '/root/telebot/logs/cron/daily_social_content.log' };
+  if (c.includes('project_scanner')) return { category: '📊 Reports & Analytics', description: '6 AM: Game Theory project portfolio scan', logPath: '/var/log/game-theory-scanner.log' };
+  if (c.includes('job_hunter')) return { category: '📊 Reports & Analytics', description: 'Every 6hr: job hunt scraper', logPath: '/root/logs/job-hunt.log' };
+
+  // Infrastructure
+  if (c.includes('env-guard') || c.includes('env.deleted by guard')) return { category: '🔧 Infrastructure', description: 'Every 5min: delete stray .env file', logPath: '/var/log/telegram-env-guard.log' };
+  if (c.includes('security_audit')) return { category: '🔧 Infrastructure', description: 'Midnight: security audit', logPath: '/root/telebot/logs/cron/security_audit.log' };
+  if (c.includes('check_plan_expiry')) return { category: '🔧 Infrastructure', description: '6:30 PM: AstroGuide plan expiry check', logPath: '/var/log/astroguide-expiry.log' };
+
+  // Default
+  return { category: '❓ Other', description: '(uncategorized)', logPath: null };
+}
+
+// Read log file and return { last_run, last_line } — best-effort
+function getCronRuntime(logPath) {
+  if (!logPath || logPath === 'sqlite-inline') return { last_run: null, last_line: null };
+  try {
+    const fs = require('fs');
+    const stat = fs.statSync(logPath);
+    const mtime = stat.mtime.toISOString().slice(0, 19).replace('T', ' ');
+    // Tail last non-empty line
+    const { execSync } = require('child_process');
+    const lastLine = execSync(
+      `tail -5 "${logPath}" 2>/dev/null | grep -v '^$' | tail -1 || echo ''`,
+      { encoding: 'utf8' }
+    ).trim().slice(0, 120);
+    return { last_run: mtime, last_line: lastLine };
+  } catch {
+    return { last_run: null, last_line: null };
+  }
+}
+
+// Special "crons" view — not a table, live-reads crontab + systemd timers
+function getCronJobs() {
+  const { execSync } = require('child_process');
+  const jobs = [];
+
+  const enrich = (rec) => {
+    const cat = categorizeCron(rec.command);
+    const rt = getCronRuntime(cat.logPath);
+    return {
+      ...rec,
+      category: cat.category,
+      description: cat.description,
+      last_run: rt.last_run,
+    };
+  };
+
+  // Parse user crontab
+  try {
+    const out = execSync('crontab -l 2>/dev/null', { encoding: 'utf8' });
+    out.split('\n').forEach((line, idx) => {
+      line = line.trim();
+      if (!line || line.startsWith('#')) return;
+      // Match: minute hour dom month dow command
+      const m = line.match(/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$/);
+      if (m) {
+        jobs.push(enrich({
+          source: 'crontab',
+          schedule: `${m[1]} ${m[2]} ${m[3]} ${m[4]} ${m[5]}`,
+          command: m[6].replace(/\s*>>.*$/, '').replace(/\s*2>.*$/, '').trim(),
+          full: line,
+          human: cronHuman(m[1], m[2], m[3], m[4], m[5]),
+        }));
+      }
+    });
+  } catch {}
+
+  // /etc/cron.d/
+  try {
+    const fs = require('fs');
+    fs.readdirSync('/etc/cron.d').forEach(name => {
+      const p = '/etc/cron.d/' + name;
+      const content = fs.readFileSync(p, 'utf8');
+      content.split('\n').forEach(line => {
+        line = line.trim();
+        if (!line || line.startsWith('#')) return;
+        const m = line.match(/^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$/);
+        if (m) {
+          jobs.push(enrich({
+            source: `/etc/cron.d/${name}`,
+            schedule: `${m[1]} ${m[2]} ${m[3]} ${m[4]} ${m[5]}`,
+            command: m[7].replace(/\s*>>.*$/, '').replace(/\s*2>.*$/, '').trim(),
+            full: line,
+            human: cronHuman(m[1], m[2], m[3], m[4], m[5]),
+          }));
+        }
+      });
+    });
+  } catch {}
+
+  // PM2 cron_restart entries
+  try {
+    const out = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8' });
+    const list = JSON.parse(out || '[]');
+    list.forEach(p => {
+      if (p.pm2_env && p.pm2_env.cron_restart) {
+        jobs.push(enrich({
+          source: 'pm2',
+          schedule: p.pm2_env.cron_restart,
+          command: `pm2 restart ${p.name}`,
+          full: `${p.name}: ${p.pm2_env.cron_restart}`,
+          human: 'PM2 restart: ' + p.pm2_env.cron_restart,
+        }));
+      }
+    });
+  } catch {}
+
+  // Systemd timers
+  try {
+    const out = execSync('systemctl list-timers --all --no-pager --output=json 2>/dev/null', { encoding: 'utf8' });
+    const timers = JSON.parse(out || '[]');
+    timers.forEach(t => {
+      jobs.push(enrich({
+        source: 'systemd-timer',
+        schedule: t.next || 'n/a',
+        command: t.unit,
+        full: `${t.unit} — next: ${t.next} — last: ${t.last || 'never'}`,
+        human: `Next: ${t.next || 'none'}`,
+      }));
+    });
+  } catch {}
+
+  return jobs;
+}
+
+function cronHuman(m, h, dom, mon, dow) {
+  // Return a compact human label
+  if (m === '*' && h === '*') return 'every minute';
+  if (m.startsWith('*/') && h === '*') return `every ${m.slice(2)} min`;
+  if (h.startsWith('*/')) return `every ${h.slice(2)} hours`;
+  if (m !== '*' && h !== '*' && dom === '*' && mon === '*' && dow === '*')
+    return `daily ${h.padStart(2,'0')}:${m.padStart(2,'0')}`;
+  if (m !== '*' && h !== '*' && dow !== '*' && dow !== '?')
+    return `weekly (dow=${dow}) ${h}:${m.padStart(2,'0')}`;
+  return `${m} ${h} ${dom} ${mon} ${dow}`;
+}
+
+app.get('/api/data/crons', (_req, res) => {
+  try {
+    const jobs = getCronJobs();
+    // Sort by category alphabetically (emoji prefix ensures stable order), then by human schedule
+    jobs.sort((a, b) =>
+      (a.category || '').localeCompare(b.category || '')
+      || (a.human || '').localeCompare(b.human || '')
+    );
+    // Build groups for UI convenience
+    const groups = {};
+    for (const j of jobs) {
+      const k = j.category || '❓ Other';
+      if (!groups[k]) groups[k] = [];
+      groups[k].push(j);
+    }
+    res.json({
+      total: jobs.length,
+      rows: jobs,
+      columns: ['category', 'description', 'human', 'command', 'last_run'],
+      label: 'Cron Jobs & Timers',
+      groups,
+      missing: false,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/data/:view', (req, res) => {
+  try {
+    const view = DATA_VIEWS[req.params.view];
+    if (!view) return res.status(404).json({ error: 'Unknown view' });
+
+    const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 500);
+    const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+    const q = (req.query.q || '').trim();
+
+    // Check that table exists (some optional tables may not be present)
+    const tableCheck = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+    ).get(view.table);
+    if (!tableCheck) {
+      return res.json({ total: 0, rows: [], columns: view.columns, label: view.label, missing: true });
+    }
+
+    // Determine which of the view.columns actually exist (defensive)
+    const pragma = db.prepare(`PRAGMA table_info(${view.table})`).all();
+    const realCols = new Set(pragma.map(r => r.name));
+    const cols = view.columns.filter(c => realCols.has(c));
+    const colList = cols.map(c => `"${c}"`).join(', ');
+
+    const params = [];
+    let where = '';
+    if (q) {
+      const searchable = view.search_cols.filter(c => realCols.has(c));
+      if (searchable.length > 0) {
+        const clauses = searchable.map(c => {
+          params.push(`%${q}%`);
+          return `COALESCE("${c}",'') LIKE ?`;
+        });
+        where = 'WHERE ' + clauses.join(' OR ');
+      }
+    }
+
+    const totalRow = db.prepare(
+      `SELECT COUNT(*) AS n FROM ${view.table} ${where}`
+    ).get(...params);
+    const total = totalRow.n;
+
+    params.push(limit, offset);
+    const rows = db.prepare(
+      `SELECT ${colList} FROM ${view.table} ${where} `
+      + `ORDER BY ${view.order_by} LIMIT ? OFFSET ?`
+    ).all(...params);
+
+    res.json({ total, rows, columns: cols, label: view.label, missing: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/data', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(DATA_BROWSER_HTML);
+});
 
 // Serve dashboard for all non-API routes (SPA fallback)
 app.get('*', (req, res) => {
